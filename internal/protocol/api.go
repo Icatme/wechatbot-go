@@ -14,7 +14,6 @@ import (
 	"net/url"
 	"strconv"
 	"time"
-
 )
 
 const (
@@ -100,8 +99,8 @@ func (c *Client) baseInfo() map[string]string {
 
 // QRCodeResponse from get_bot_qrcode.
 type QRCodeResponse struct {
-	QRCode         string `json:"qrcode"`
-	QRCodeImgURL   string `json:"qrcode_img_content"`
+	QRCode       string `json:"qrcode"`
+	QRCodeImgURL string `json:"qrcode_img_content"`
 }
 
 // QRStatusResponse from get_qrcode_status.
@@ -116,12 +115,12 @@ type QRStatusResponse struct {
 
 // GetUpdatesResponse from getupdates.
 type GetUpdatesResponse struct {
-	Ret                 int               `json:"ret"`
-	Msgs                []json.RawMessage `json:"msgs"`
-	GetUpdatesBuf       string            `json:"get_updates_buf"`
-	ErrCode             int               `json:"errcode,omitempty"`
-	ErrMsg              string            `json:"errmsg,omitempty"`
-	LongPollingTimeoutMs int              `json:"longpolling_timeout_ms,omitempty"`
+	Ret                  int               `json:"ret"`
+	Msgs                 []json.RawMessage `json:"msgs"`
+	GetUpdatesBuf        string            `json:"get_updates_buf"`
+	ErrCode              int               `json:"errcode,omitempty"`
+	ErrMsg               string            `json:"errmsg,omitempty"`
+	LongPollingTimeoutMs int               `json:"longpolling_timeout_ms,omitempty"`
 }
 
 // GetConfigResponse from getconfig.
@@ -256,10 +255,10 @@ func (c *Client) GetConfig(ctx context.Context, baseURL, token, userID, contextT
 // SendTyping sends or cancels the typing indicator.
 func (c *Client) SendTyping(ctx context.Context, baseURL, token, userID, ticket string, status int) error {
 	body := map[string]interface{}{
-		"ilink_user_id":  userID,
-		"typing_ticket":  ticket,
-		"status":         status,
-		"base_info":      c.baseInfo(),
+		"ilink_user_id": userID,
+		"typing_ticket": ticket,
+		"status":        status,
+		"base_info":     c.baseInfo(),
 	}
 	_, err := c.apiPost(ctx, baseURL, "/ilink/bot/sendtyping", token, body, 15*time.Second)
 	return err
@@ -303,21 +302,21 @@ type GetUploadURLResponse struct {
 	UploadParam      string `json:"upload_param"`
 	ThumbUploadParam string `json:"thumb_upload_param,omitempty"`
 	// Complete upload URL returned by server; when set, use directly instead of building from UploadParam.
-	UploadFullURL    string `json:"upload_full_url,omitempty"`
+	UploadFullURL string `json:"upload_full_url,omitempty"`
 }
 
 // GetUploadURL requests an upload URL for CDN media upload.
 func (c *Client) GetUploadURL(ctx context.Context, baseURL, token string, req GetUploadURLRequest) (*GetUploadURLResponse, error) {
 	body := map[string]interface{}{
-		"filekey":        req.FileKey,
-		"media_type":     req.MediaType,
-		"to_user_id":     req.ToUserID,
-		"rawsize":        req.RawSize,
-		"rawfilemd5":     req.RawFileMD5,
-		"filesize":       req.FileSize,
-		"no_need_thumb":  req.NoNeedThumb,
-		"aeskey":         req.AESKey,
-		"base_info":      c.baseInfo(),
+		"filekey":       req.FileKey,
+		"media_type":    req.MediaType,
+		"to_user_id":    req.ToUserID,
+		"rawsize":       req.RawSize,
+		"rawfilemd5":    req.RawFileMD5,
+		"filesize":      req.FileSize,
+		"no_need_thumb": req.NoNeedThumb,
+		"aeskey":        req.AESKey,
+		"base_info":     c.baseInfo(),
 	}
 	raw, err := c.apiPost(ctx, baseURL, "/ilink/bot/getuploadurl", token, body, 15*time.Second)
 	if err != nil {

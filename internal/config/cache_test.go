@@ -10,9 +10,9 @@ import (
 )
 
 type fakeProvider struct {
-	calls     int
-	ticket    string
-	err       error
+	calls  int
+	ticket string
+	err    error
 }
 
 func (f *fakeProvider) GetConfig(ctx context.Context, baseURL, token, userID, contextToken string) (*protocol.GetConfigResponse, error) {

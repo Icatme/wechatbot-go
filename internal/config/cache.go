@@ -28,6 +28,7 @@ type entry struct {
 	everSucceeded bool
 	nextFetchAt   time.Time
 	retryDelay    time.Duration
+	mu            sync.Mutex
 }
 
 // CachedConfig is the subset of getconfig fields we cache.
@@ -39,7 +40,7 @@ type CachedConfig struct {
 type Cache struct {
 	apiOpts APIOpts
 	cache   map[string]*entry
-	mu      sync.Mutex
+	mu      sync.RWMutex
 }
 
 // APIOpts holds the parameters needed to call getConfig.
@@ -59,11 +60,11 @@ func NewCache(opts APIOpts) *Cache {
 
 // GetForUser returns the cached config for a user, fetching if necessary.
 func (c *Cache) GetForUser(ctx context.Context, userID, contextToken string) (CachedConfig, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	e, exists := c.cache[userID]
+	c.mu.RUnlock()
 
 	now := time.Now()
-	e, exists := c.cache[userID]
 	shouldFetch := !exists || now.After(e.nextFetchAt)
 
 	if !shouldFetch {
@@ -72,7 +73,18 @@ func (c *Cache) GetForUser(ctx context.Context, userID, contextToken string) (Ca
 
 	if e == nil {
 		e = &entry{}
+		c.mu.Lock()
 		c.cache[userID] = e
+		c.mu.Unlock()
+	}
+
+	// Serialize fetches for the same user to avoid thundering herd.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Double-check after acquiring the per-user lock.
+	if now.Before(e.nextFetchAt) {
+		return e.config, nil
 	}
 
 	resp, err := c.apiOpts.Client.GetConfig(ctx, c.apiOpts.BaseURL, c.apiOpts.Token, userID, contextToken)

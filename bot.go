@@ -298,7 +298,11 @@ func (b *Bot) Run(ctx context.Context) error {
 		b.log("warn", "NotifyStart failed: %v", err)
 	}
 	defer func() {
-		if stopErr := b.client.NotifyStop(context.Background(), creds.BaseURL, creds.Token); stopErr != nil {
+		stopCreds := b.getCreds()
+		if stopCreds == nil {
+			return
+		}
+		if stopErr := b.client.NotifyStop(context.Background(), stopCreds.BaseURL, stopCreds.Token); stopErr != nil {
 			b.log("warn", "NotifyStop failed: %v", stopErr)
 		}
 	}()

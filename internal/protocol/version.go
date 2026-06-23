@@ -31,16 +31,24 @@ func parseVersionPart(s string) int {
 }
 
 // moduleVersion returns the module version at build time, or a fallback.
+// Development builds report "(devel)"; in that case fall back to ChannelVersion.
 func moduleVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, dep := range info.Deps {
 			if dep.Path == "github.com/Icatme/wechatbot-go" {
-				return dep.Version
+				if isValidVersion(dep.Version) {
+					return dep.Version
+				}
+				break
 			}
 		}
-		if info.Main.Path == "github.com/Icatme/wechatbot-go" {
+		if info.Main.Path == "github.com/Icatme/wechatbot-go" && isValidVersion(info.Main.Version) {
 			return info.Main.Version
 		}
 	}
 	return ChannelVersion
+}
+
+func isValidVersion(v string) bool {
+	return v != "" && v != "(devel)"
 }

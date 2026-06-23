@@ -14,7 +14,7 @@ const (
 
 // Guard tracks whether a bot session is currently paused due to expiry.
 type Guard struct {
-	mu        sync.RWMutex
+	mu          sync.RWMutex
 	pausedUntil time.Time
 }
 
@@ -31,9 +31,10 @@ func (g *Guard) Pause() {
 }
 
 // IsPaused reports whether the session is still within its pause window.
+// Expired pauses are auto-cleared.
 func (g *Guard) IsPaused() bool {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	if g.pausedUntil.IsZero() {
 		return false
 	}
@@ -46,6 +47,7 @@ func (g *Guard) IsPaused() bool {
 }
 
 // Remaining returns the duration until the pause expires, or 0 if not paused.
+// Callers should typically call IsPaused first to expire stale pauses.
 func (g *Guard) Remaining() time.Duration {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -53,8 +55,7 @@ func (g *Guard) Remaining() time.Duration {
 		return 0
 	}
 	remaining := g.pausedUntil.Sub(time.Now())
-	if remaining <= 0 {
-		g.pausedUntil = time.Time{}
+	if remaining < 0 {
 		return 0
 	}
 	return remaining
