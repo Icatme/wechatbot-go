@@ -58,11 +58,14 @@ type Bot struct {
 	configCache   *config.Cache
 	sessionGuard  *session.Guard
 	handlers      []MessageHandler
+	middlewares   []Middleware
 	contextTokens *store.ContextStore
 	cursorStore   *store.CursorStore
 	stopped       bool
 	mu            sync.Mutex
 	cancelPoll    context.CancelFunc
+	hooks         LifecycleHooks
+	logger        func(level, msg string)
 }
 
 // New creates a new Bot instance.
@@ -92,15 +95,16 @@ func New(opts ...Options) *Bot {
 		sessionGuard:  session.NewGuard(),
 		contextTokens: store.NewContextStore(o.AccountID, o.ContextTokenPath),
 		cursorStore:   store.NewCursorStore(o.AccountID, o.CursorPath),
+		hooks:         LifecycleHooks{},
 	}
 }
 
 // Login performs QR code login or loads stored credentials.
 func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 	creds, err := auth.Login(ctx, b.client, auth.LoginOptions{
-		BaseURL:   b.opts.BaseURL,
-		CredPath:  b.opts.CredPath,
-		Force:     force,
+		BaseURL:      b.opts.BaseURL,
+		CredPath:     b.opts.CredPath,
+		Force:        force,
 		OnQRURL:      b.opts.OnQRURL,
 		OnScanned:    b.opts.OnScanned,
 		OnExpired:    b.opts.OnExpired,
@@ -126,18 +130,32 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 
 	b.log("info", "Logged in as %s", creds.UserID)
 
-	return &Credentials{
+	public := &Credentials{
 		Token:     creds.Token,
 		BaseURL:   creds.BaseURL,
 		AccountID: creds.AccountID,
 		UserID:    creds.UserID,
 		SavedAt:   creds.SavedAt,
-	}, nil
+	}
+	if err := b.hooks.AfterLogin.Run(public); err != nil {
+		b.log("warn", "AfterLogin hook failed: %v", err)
+	}
+	return public, nil
 }
 
 // OnMessage registers a message handler.
 func (b *Bot) OnMessage(handler MessageHandler) {
 	b.handlers = append(b.handlers, handler)
+}
+
+// Use adds a middleware to the incoming message pipeline.
+func (b *Bot) Use(mw Middleware) {
+	b.middlewares = append(b.middlewares, mw)
+}
+
+// Hooks returns the bot's lifecycle hook registry for extension.
+func (b *Bot) Hooks() *LifecycleHooks {
+	return &b.hooks
 }
 
 // Reply sends a text reply to an incoming message.
@@ -384,6 +402,15 @@ func (b *Bot) Run(ctx context.Context) error {
 		b.log("warn", "Failed to load cursor: %v", loadErr)
 	}
 
+	if err := b.hooks.BeforeLogin.Run(&Credentials{
+		Token:     creds.Token,
+		BaseURL:   creds.BaseURL,
+		AccountID: creds.AccountID,
+		UserID:    creds.UserID,
+		SavedAt:   creds.SavedAt,
+	}); err != nil {
+		b.log("warn", "BeforeLogin hook failed: %v", err)
+	}
 	if err := b.client.NotifyStart(pollCtx, creds.BaseURL, creds.Token); err != nil {
 		b.log("warn", "NotifyStart failed: %v", err)
 	}
@@ -463,6 +490,13 @@ func (b *Bot) Run(ctx context.Context) error {
 			if incoming == nil {
 				continue
 			}
+			if err := b.hooks.AfterReceive.Run(incoming); err != nil {
+				b.log("warn", "AfterReceive hook failed: %v", err)
+				continue
+			}
+			if !b.runMiddleware(incoming) {
+				continue
+			}
 			for _, h := range b.handlers {
 				h(incoming)
 			}
@@ -483,6 +517,10 @@ func (b *Bot) Stop() {
 // --- internal ---
 
 func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, content SendContent) error {
+	if err := b.hooks.BeforeSend.Run(&content); err != nil {
+		return fmt.Errorf("BeforeSend hook failed: %w", err)
+	}
+
 	// Text-only path.
 	if content.Text != "" {
 		return b.sendText(ctx, userID, content.Text, contextToken)
@@ -807,6 +845,15 @@ func (b *Bot) getCreds() *auth.Credentials {
 	return b.creds
 }
 
+func (b *Bot) runMiddleware(msg *IncomingMessage) bool {
+	for _, mw := range b.middlewares {
+		if mw != nil && !mw(msg) {
+			return false
+		}
+	}
+	return true
+}
+
 func (b *Bot) reportError(err error) {
 	b.log("error", "%v", err)
 	if b.opts.OnError != nil {
@@ -819,6 +866,27 @@ func (b *Bot) log(level, format string, args ...interface{}) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "[wechatbot] %s\n", fmt.Sprintf(format, args...))
+}
+
+// SetLogger replaces the default stderr logger with a custom implementation.
+func (b *Bot) SetLogger(fn func(level, msg string)) {
+	if fn == nil {
+		return
+	}
+	b.mu.Lock()
+	b.logger = fn
+	b.mu.Unlock()
+}
+
+func (b *Bot) doLog(level, format string, args ...interface{}) {
+	b.mu.Lock()
+	logger := b.logger
+	b.mu.Unlock()
+	if logger != nil {
+		logger(level, fmt.Sprintf(format, args...))
+		return
+	}
+	b.log(level, format, args...)
 }
 
 func detectType(items []MessageItem) ContentType {
