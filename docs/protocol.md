@@ -6,12 +6,14 @@ CDN URL: `https://novac2c.cdn.weixin.qq.com/c2c`
 ## Authentication (QR Login)
 
 ### Step 1: Get QR Code
+
 ```
 GET /ilink/bot/get_bot_qrcode?bot_type=3
 → { qrcode: "<token>", qrcode_img_content: "<url>" }
 ```
 
 ### Step 2: Poll Status
+
 ```
 GET /ilink/bot/get_qrcode_status?qrcode=<token>
 Headers: { "iLink-App-ClientVersion": "1" }
@@ -19,24 +21,29 @@ Headers: { "iLink-App-ClientVersion": "1" }
 ```
 
 ## Common Headers (all POST requests)
+
 ```
 Content-Type: application/json
 AuthorizationType: ilink_bot_token
 Authorization: Bearer <bot_token>
 X-WECHAT-UIN: <base64(String(randomUint32))>
 ```
+
 All POST bodies include: `base_info: { channel_version: "<version>" }`
 
 ## Get Updates (Long Poll)
+
 ```
 POST /ilink/bot/getupdates
 Body: { get_updates_buf: "<cursor>", base_info: {...} }
 Timeout: 35s (server holds connection)
 → { ret: 0, msgs: [], get_updates_buf: "<new_cursor>" }
 ```
+
 Error: `errcode: -14` = session expired (re-login needed)
 
 ## Send Message
+
 ```
 POST /ilink/bot/sendmessage
 Body: {
@@ -54,6 +61,7 @@ Body: {
 ```
 
 ## Send Typing
+
 ```
 POST /ilink/bot/getconfig
 → { typing_ticket: "<ticket>" }
@@ -63,6 +71,7 @@ Body: { ilink_user_id: "<id>", typing_ticket: "<ticket>", status: 1|2, base_info
 ```
 
 ## Media Upload
+
 ```
 POST /ilink/bot/getuploadurl
 → { upload_param: "<encrypted>" }
@@ -74,12 +83,14 @@ Response Header: x-encrypted-param → download param
 ```
 
 ## Media Download
+
 ```
 GET <cdn>/download?encrypted_query_param=<param>
 → AES-128-ECB encrypted bytes → decrypt with aes_key
 ```
 
 ## Message Item Types
+
 | Type | Value | Description |
 |------|-------|-------------|
 | TEXT | 1 | Text content |
@@ -89,6 +100,7 @@ GET <cdn>/download?encrypted_query_param=<param>
 | VIDEO | 5 | Video with optional thumbnail |
 
 ## AES Key Formats
+
 | Format | Example | Usage |
 |--------|---------|-------|
 | base64(raw 16 bytes) | `ABEiM0RVZneImaq7zN3u/w==` | CDNMedia.aes_key (format A) |
@@ -96,6 +108,7 @@ GET <cdn>/download?encrypted_query_param=<param>
 | direct hex (32 chars) | `00112233445566778899aabbccddeeff` | image_item.aeskey |
 
 ## Error Codes
+
 | Code | Meaning | Action |
 |------|---------|--------|
 | `ret: 0` | Success | — |
@@ -103,6 +116,7 @@ GET <cdn>/download?encrypted_query_param=<param>
 | `ret: -2` | Parameter error | Check request |
 
 ## context_token
+
 - **Required** for every reply — routes messages to the correct conversation
 - Cache per `(accountId, userId)` pair
 - Persist across restarts

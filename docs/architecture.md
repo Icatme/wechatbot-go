@@ -37,14 +37,18 @@ graph TD
 ## Shared Concepts
 
 ### context_token
+
 Every reply must include the `context_token` from the incoming message. All SDKs:
+
 1. Cache tokens in memory per `(userId)`
 2. Auto-extract from incoming messages
 3. Auto-inject into outgoing messages via `reply()`
 4. (Node.js) Persist to storage for restart survival
 
 ### QR Login Flow
+
 All SDKs implement the same flow:
+
 1. `GET /get_bot_qrcode` → get QR URL
 2. Display QR to user
 3. `GET /get_qrcode_status` poll loop (2s interval)
@@ -52,6 +56,7 @@ All SDKs implement the same flow:
 5. On `expired` → request new QR
 
 ### Long-Poll Loop
+
 1. `POST /getupdates` with cursor (35s server hold)
 2. Parse messages, cache context_tokens
 3. Dispatch to handlers
@@ -59,11 +64,14 @@ All SDKs implement the same flow:
 5. On network error → exponential backoff (1s → 10s max)
 
 ### Media Pipeline
+
 All SDKs support encrypted media upload and download via the WeChat CDN:
+
 1. **Upload**: generate AES key → encrypt (AES-128-ECB) → getuploadurl → POST to CDN → get download param
 2. **Download**: GET from CDN → decrypt (AES-128-ECB) with key from message
 
 The Node.js SDK additionally provides:
+
 - **Unified `reply(msg, content)` / `send(userId, content)`** — one method handles text, image, video, file, and URL
 - **Auto-routing by MIME** — `{ file: data, fileName: 'photo.png' }` routes as image; `.mp4` as video; others as file attachment
 - **Remote URL support** — `{ url: 'https://...' }` auto-downloads and sends
@@ -71,7 +79,9 @@ The Node.js SDK additionally provides:
 - **Markdown stripping** — `stripMarkdown()` for cleaning AI model output before sending to WeChat
 
 ### Text Chunking
+
 All SDKs split text at 2000 characters:
+
 - Priority: paragraph break (`\n\n`) → line break (`\n`) → space → hard cut
 - Each chunk gets a unique `client_id`
 - All chunks share the same `context_token`
@@ -79,6 +89,7 @@ All SDKs split text at 2000 characters:
 ## File Structure
 
 ### Node.js
+
 ```
 nodejs/
 ├── src/
@@ -98,6 +109,7 @@ nodejs/
 ```
 
 ### Python
+
 ```
 python/
 ├── wechatbot/
@@ -116,6 +128,7 @@ python/
 ```
 
 ### Go
+
 ```
 golang/
 ├── types.go                # All public types
@@ -129,6 +142,7 @@ golang/
 ```
 
 ### Rust
+
 ```
 rust/
 ├── src/

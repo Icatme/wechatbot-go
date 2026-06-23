@@ -1,13 +1,24 @@
-node_modules/
-dist/
-tmp/
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
 .DS_Store
-*.tsbuildinfo
-.next/
-next-env.d.ts
-target/
-package-lock.json
-__pycache__/
-*.pyc
-*.egg-info/
-.pytest_cache/
+
+# OS
+Thumbs.db
+
+# Project
+/tmp/
+*.log
