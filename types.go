@@ -55,7 +55,7 @@ type CDNMedia struct {
 	AESKey            string `json:"aes_key"`
 	EncryptType       int    `json:"encrypt_type,omitempty"`
 	// FullURL is the complete download URL returned by server; when set, use directly.
-	FullURL           string `json:"full_url,omitempty"`
+	FullURL string `json:"full_url,omitempty"`
 }
 
 // TextItem holds text content.
@@ -119,16 +119,16 @@ type MessageItem struct {
 
 // WireMessage is the raw message from the iLink API.
 type WireMessage struct {
-	Seq          int64           `json:"seq,omitempty"`
-	MessageID    int64           `json:"message_id,omitempty"`
-	FromUserID   string          `json:"from_user_id"`
-	ToUserID     string          `json:"to_user_id"`
-	ClientID     string          `json:"client_id"`
-	CreateTimeMs int64           `json:"create_time_ms"`
-	MessageType  MessageType     `json:"message_type"`
-	MessageState MessageState    `json:"message_state"`
-	ContextToken string          `json:"context_token"`
-	ItemList     []MessageItem   `json:"item_list"`
+	Seq          int64         `json:"seq,omitempty"`
+	MessageID    int64         `json:"message_id,omitempty"`
+	FromUserID   string        `json:"from_user_id"`
+	ToUserID     string        `json:"to_user_id"`
+	ClientID     string        `json:"client_id"`
+	CreateTimeMs int64         `json:"create_time_ms"`
+	MessageType  MessageType   `json:"message_type"`
+	MessageState MessageState  `json:"message_state"`
+	ContextToken string        `json:"context_token"`
+	ItemList     []MessageItem `json:"item_list"`
 }
 
 // ContentType is the primary type of an incoming message.

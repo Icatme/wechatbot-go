@@ -2,10 +2,12 @@
 package log
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,7 +29,7 @@ type Field struct {
 	Value interface{}
 }
 
-// F returns a Field. Values are redacted if they look like sensitive tokens.
+// F returns a Field.
 func F(key string, value interface{}) Field {
 	return Field{Key: key, Value: value}
 }
@@ -87,14 +89,20 @@ func (l *Logger) Log(level Level, msg string, fields ...Field) {
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	var b strings.Builder
-	fmt.Fprintf(&b, "{\"time\":%q,\"level\":%q,\"msg\":%q", now, level, l.redact(msg))
+	b.WriteString("{")
+	writeJSONField(&b, "time", now, false)
+	b.WriteString(",")
+	writeJSONField(&b, "level", string(level), false)
+	b.WriteString(",")
+	writeJSONField(&b, "msg", redactMessage(l.redact(msg)), false)
 	for _, f := range fields {
-		key := l.sanitizeKey(f.Key)
+		b.WriteString(",")
+		key := sanitizeKey(f.Key)
 		if isSensitiveKey(f.Key) {
-			fmt.Fprintf(&b, ",%q:\"***\"", key)
+			writeJSONField(&b, key, "***", false)
 			continue
 		}
-		fmt.Fprintf(&b, ",%q:%s", key, l.formatValue(f.Value))
+		writeValue(&b, key, f.Value, l)
 	}
 	b.WriteString("}\n")
 
@@ -103,32 +111,63 @@ func (l *Logger) Log(level Level, msg string, fields ...Field) {
 	l.mu.Unlock()
 }
 
-func (l *Logger) formatValue(v interface{}) string {
-	switch x := v.(type) {
-	case string:
-		return fmt.Sprintf("%q", l.redact(x))
-	case error:
-		return fmt.Sprintf("%q", l.redact(x.Error()))
-	case int, int64, int32, uint, uint64, float64, float32, bool:
-		return fmt.Sprintf("%v", x)
-	default:
-		return fmt.Sprintf("%q", l.redact(fmt.Sprintf("%v", x)))
+func writeJSONField(b *strings.Builder, key, value string, isNumber bool) {
+	b.WriteString(strconv.Quote(key))
+	b.WriteString(":")
+	if isNumber {
+		b.WriteString(value)
+	} else {
+		b.WriteString(strconv.Quote(value))
 	}
 }
 
-func (l *Logger) sanitizeKey(key string) string {
-	key = strings.ReplaceAll(key, `"`, `_`)
-	key = strings.ReplaceAll(key, "\n", `_`)
-	return key
+func writeValue(b *strings.Builder, key string, v interface{}, l *Logger) {
+	b.WriteString(strconv.Quote(key))
+	b.WriteString(":")
+	switch x := v.(type) {
+	case string:
+		b.WriteString(strconv.Quote(l.redact(x)))
+	case error:
+		b.WriteString(strconv.Quote(l.redact(x.Error())))
+	case int:
+		b.WriteString(strconv.FormatInt(int64(x), 10))
+	case int64:
+		b.WriteString(strconv.FormatInt(x, 10))
+	case int32:
+		b.WriteString(strconv.FormatInt(int64(x), 10))
+	case uint:
+		b.WriteString(strconv.FormatUint(uint64(x), 10))
+	case uint64:
+		b.WriteString(strconv.FormatUint(x, 10))
+	case float64:
+		b.WriteString(strconv.FormatFloat(x, 'f', -1, 64))
+	case float32:
+		b.WriteString(strconv.FormatFloat(float64(x), 'f', -1, 32))
+	case bool:
+		b.WriteString(strconv.FormatBool(x))
+	default:
+		data, err := json.Marshal(x)
+		if err != nil {
+			b.WriteString(strconv.Quote(l.redact(fmt.Sprintf("%v", x))))
+			return
+		}
+		b.WriteString(l.redact(string(data)))
+	}
 }
 
 func (l *Logger) redact(s string) string {
 	return l.redactor.Replace(s)
 }
 
+func sanitizeKey(key string) string {
+	key = strings.ReplaceAll(key, "\x00", "")
+	return key
+}
+
 var sensitiveKeyPatterns = []string{
-	"token", "auth", "credential", "password", "secret", "api_key", "apikey", "aes",
-	"encrypt_query_param", "filekey", "bot_token", "context_token", "typing_ticket",
+	"_token", "token_", "bot_token", "context_token", "typing_ticket",
+	"auth_", "_auth", "credential", "password", "secret", "api_key", "apikey",
+	"aes_key", "encrypt_query_param", "filekey",
 }
 
 func isSensitiveKey(key string) bool {
@@ -144,7 +183,6 @@ func isSensitiveKey(key string) bool {
 func buildRedactor(extra []string) *strings.Replacer {
 	// Redact common token patterns in free-form strings.
 	replacements := []string{
-		// bot_token=... and context_token=...
 		"bot_token=", "bot_token=***",
 		"context_token=", "context_token=***",
 		"typing_ticket=", "typing_ticket=***",
@@ -157,10 +195,15 @@ func buildRedactor(extra []string) *strings.Replacer {
 	return strings.NewReplacer(replacements...)
 }
 
-var tokenPattern = regexp.MustCompile(`\b(bot_token|context_token|typing_ticket|encrypt_query_param|filekey)=[^\s&\"]+`)
+var tokenPattern = regexp.MustCompile(`\b(bot_token|context_token|typing_ticket|encrypt_query_param|filekey)=[^\s&"]+`)
 
 // RedactString returns a copy of s with known token query parameters redacted.
 func RedactString(s string) string {
+	return tokenPattern.ReplaceAllString(s, "$1=***")
+}
+
+// redactMessage scans a free-form message and redacts embedded token values.
+func redactMessage(s string) string {
 	return tokenPattern.ReplaceAllString(s, "$1=***")
 }
 

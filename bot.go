@@ -559,32 +559,36 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		if err != nil {
 			return err
 		}
+		imageItem := map[string]interface{}{
+			"media":    cdnMediaMap(&result.Media),
+			"mid_size": result.EncryptedFileSize,
+		}
+		if result.ThumbMedia.EncryptQueryParam != "" {
+			imageItem["thumb_media"] = cdnMediaMap(&result.ThumbMedia)
+		}
 		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
-			"type": 2, "image_item": map[string]interface{}{
-				"media":       cdnMediaMap(&result.Media),
-				"thumb_media": cdnMediaMap(&result.ThumbMedia),
-				"mid_size":    result.EncryptedFileSize,
-			},
+			"type": 2, "image_item": imageItem,
 		}})
 		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
 	}
 
 	// Video
 	if content.Video != nil {
-		thumbData, _ := thumb.FromImage(content.Video)
-		if thumbData == nil {
-			thumbData = thumb.Placeholder()
-		}
+		// Go has no standard video frame extraction; use a placeholder thumbnail.
+		thumbData := thumb.Placeholder()
 		result, err := b.cdnUploadWithThumb(ctx, creds, content.Video, thumbData, userID, int(MediaVideo))
 		if err != nil {
 			return err
 		}
+		videoItem := map[string]interface{}{
+			"media":      cdnMediaMap(&result.Media),
+			"video_size": result.EncryptedFileSize,
+		}
+		if result.ThumbMedia.EncryptQueryParam != "" {
+			videoItem["thumb_media"] = cdnMediaMap(&result.ThumbMedia)
+		}
 		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
-			"type": 5, "video_item": map[string]interface{}{
-				"media":       cdnMediaMap(&result.Media),
-				"thumb_media": cdnMediaMap(&result.ThumbMedia),
-				"video_size":  result.EncryptedFileSize,
-			},
+			"type": 5, "video_item": videoItem,
 		}})
 		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
 	}

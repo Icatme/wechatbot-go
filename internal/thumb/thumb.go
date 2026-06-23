@@ -18,7 +18,8 @@ const (
 )
 
 // FromImage decodes image data and returns a JPEG thumbnail.
-// Supported input formats include JPEG and PNG.
+// Supported input formats include any format registered with image.Decode
+// (typically JPEG, PNG, GIF, WebP when imported).
 func FromImage(data []byte) ([]byte, error) {
 	img, format, err := image.Decode(bytes.NewReader(data))
 	if err != nil {

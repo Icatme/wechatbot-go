@@ -326,10 +326,10 @@ type GetUploadURLResponse struct {
 // GetUploadURL requests an upload URL for CDN media upload.
 func (c *Client) GetUploadURL(ctx context.Context, baseURL, token string, req GetUploadURLRequest) (*GetUploadURLResponse, error) {
 	body := map[string]interface{}{
-		"filekey":       req.FileKey,
-		"media_type":    req.MediaType,
-		"to_user_id":    req.ToUserID,
-		"rawsize":       req.RawSize,
+		"filekey":          req.FileKey,
+		"media_type":       req.MediaType,
+		"to_user_id":       req.ToUserID,
+		"rawsize":          req.RawSize,
 		"rawfilemd5":       req.RawFileMD5,
 		"filesize":         req.FileSize,
 		"thumb_rawsize":    req.ThumbRawSize,
