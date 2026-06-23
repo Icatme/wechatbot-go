@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"time"
 )
+
+const maxDownloadBytes = 100 * 1024 * 1024
 
 // Download fetches a remote URL and returns the body bytes plus a suggested filename.
 // The context controls the request timeout/cancellation.
+// Downloads are capped at 100 MiB to avoid unbounded memory use.
 func Download(ctx context.Context, rawURL string) (data []byte, fileName string, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
@@ -25,8 +27,7 @@ func Download(ctx context.Context, rawURL string) (data []byte, fileName string,
 		return nil, "", fmt.Errorf("create request: %w", err)
 	}
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch remote media: %w", err)
 	}
@@ -36,9 +37,13 @@ func Download(ctx context.Context, rawURL string) (data []byte, fileName string,
 		return nil, "", fmt.Errorf("remote media download failed: HTTP %d", resp.StatusCode)
 	}
 
-	data, err = io.ReadAll(resp.Body)
+	reader := io.LimitReader(resp.Body, maxDownloadBytes+1)
+	data, err = io.ReadAll(reader)
 	if err != nil {
 		return nil, "", fmt.Errorf("read remote media: %w", err)
+	}
+	if len(data) > maxDownloadBytes {
+		return nil, "", fmt.Errorf("remote media exceeds %d bytes", maxDownloadBytes)
 	}
 
 	fileName = suggestedFileName(resp, u)

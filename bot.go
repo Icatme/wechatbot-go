@@ -133,7 +133,11 @@ func (b *Bot) Reply(ctx context.Context, msg *IncomingMessage, text string) erro
 	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
 		b.log("warn", "failed to persist context token: %v", err)
 	}
-	return b.sendText(ctx, msg.UserID, text, msg.ContextToken)
+	if err := b.sendText(ctx, msg.UserID, text, msg.ContextToken); err != nil {
+		b.notifyError(ctx, msg.UserID, msg.ContextToken, err)
+		return err
+	}
+	return nil
 }
 
 // Send sends a text message to a user (requires prior context_token).
@@ -142,7 +146,11 @@ func (b *Bot) Send(ctx context.Context, userID, text string) error {
 	if ct == "" {
 		return fmt.Errorf("no context_token for user %s", userID)
 	}
-	return b.sendText(ctx, userID, text, ct)
+	if err := b.sendText(ctx, userID, text, ct); err != nil {
+		b.notifyError(ctx, userID, ct, err)
+		return err
+	}
+	return nil
 }
 
 // SendTyping shows the "typing..." indicator.

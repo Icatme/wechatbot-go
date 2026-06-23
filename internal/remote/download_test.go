@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"strings"
 	"time"
 )
 
@@ -64,5 +65,17 @@ func TestDownloadContextTimeout(t *testing.T) {
 	_, _, err := Download(ctx, ts.URL)
 	if err == nil {
 		t.Fatal("expected timeout error")
+	}
+}
+
+func TestDownloadMaxSize(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, strings.Repeat("x", maxDownloadBytes+1))
+	}))
+	defer ts.Close()
+
+	_, _, err := Download(context.Background(), ts.URL)
+	if err == nil {
+		t.Fatal("expected max size error")
 	}
 }
