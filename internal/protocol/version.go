@@ -4,6 +4,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // buildClientVersion computes the iLink-App-ClientVersion uint32 from a semantic version.
@@ -51,4 +52,26 @@ func moduleVersion() string {
 
 func isValidVersion(v string) bool {
 	return v != "" && v != "(devel)"
+}
+
+var (
+	cachedModuleVersion     string
+	cachedClientVersion     string
+	cachedModuleVersionOnce sync.Once
+)
+
+// clientVersion returns the iLink-App-ClientVersion header value as a decimal string.
+// The value is computed once per process since the module version does not change at runtime.
+func clientVersion() string {
+	cachedModuleVersionOnce.Do(func() {
+		cachedModuleVersion = moduleVersion()
+		cachedClientVersion = strconv.FormatUint(uint64(buildClientVersion(cachedModuleVersion)), 10)
+	})
+	return cachedClientVersion
+}
+
+// moduleVersionClean returns the resolved module version, falling back to ChannelVersion.
+func moduleVersionClean() string {
+	clientVersion() // ensure cache is populated
+	return cachedModuleVersion
 }

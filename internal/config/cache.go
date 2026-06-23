@@ -82,8 +82,8 @@ func (c *Cache) GetForUser(ctx context.Context, userID, contextToken string) (Ca
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Double-check after acquiring the per-user lock.
-	if now.Before(e.nextFetchAt) {
+	// Double-check after acquiring the per-user lock (use fresh time).
+	if time.Now().Before(e.nextFetchAt) {
 		return e.config, nil
 	}
 

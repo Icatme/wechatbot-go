@@ -320,11 +320,13 @@ func (b *Bot) Run(ctx context.Context) error {
 
 		if remaining := b.sessionGuard.Remaining(); remaining > 0 {
 			b.log("warn", "Session paused, waiting %v", remaining.Round(time.Second))
+			timer := time.NewTimer(remaining)
 			select {
 			case <-pollCtx.Done():
+				timer.Stop()
 				b.log("info", "Long-poll loop stopped")
 				return nil
-			case <-time.After(remaining):
+			case <-timer.C:
 				continue
 			}
 		}

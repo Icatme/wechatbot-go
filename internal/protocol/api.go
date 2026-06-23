@@ -24,11 +24,6 @@ const (
 	iLinkAppID = "bot"
 )
 
-// clientVersion returns the iLink-App-ClientVersion header value as a decimal string.
-func clientVersion() string {
-	return strconv.FormatUint(uint64(buildClientVersion(moduleVersion())), 10)
-}
-
 // APIError is returned when the iLink API returns a non-zero ret or HTTP error.
 type APIError struct {
 	Message    string
@@ -90,7 +85,7 @@ func NewClient() *Client {
 }
 
 func (c *Client) baseInfo() map[string]string {
-	info := map[string]string{"channel_version": ChannelVersion}
+	info := map[string]string{"channel_version": moduleVersionClean()}
 	if c.BotAgent != "" {
 		info["bot_agent"] = c.BotAgent
 	}
