@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -26,6 +25,8 @@ import (
 	"github.com/Icatme/wechatbot-go/internal/remote"
 	"github.com/Icatme/wechatbot-go/internal/session"
 	"github.com/Icatme/wechatbot-go/internal/store"
+	"github.com/Icatme/wechatbot-go/internal/thumb"
+	botlog "github.com/Icatme/wechatbot-go/log"
 )
 
 // MessageHandler is called for each incoming user message.
@@ -43,6 +44,7 @@ type Options struct {
 	StripMarkdown    bool   // strip markdown from outbound text
 	NotifyErrors     bool   // automatically notify user on send failure
 	LogLevel         string // "debug", "info", "warn", "error", "silent"
+	Logger           *botlog.Logger
 	OnQRURL          func(url string)
 	OnScanned        func()
 	OnExpired        func()
@@ -65,7 +67,7 @@ type Bot struct {
 	mu            sync.Mutex
 	cancelPoll    context.CancelFunc
 	hooks         LifecycleHooks
-	logger        func(level, msg string)
+	logger        loggerAdapter
 }
 
 // New creates a new Bot instance.
@@ -89,6 +91,14 @@ func New(opts ...Options) *Bot {
 	client := protocol.NewClient()
 	client.BotAgent = protocol.SanitizeBotAgent(o.BotAgent)
 	client.RouteTag = o.RouteTag
+
+	var logger loggerAdapter
+	if o.Logger != nil {
+		logger = o.Logger
+	} else {
+		logger = newDefaultLogger(o.LogLevel)
+	}
+
 	return &Bot{
 		opts:          o,
 		client:        client,
@@ -96,6 +106,7 @@ func New(opts ...Options) *Bot {
 		contextTokens: store.NewContextStore(o.AccountID, o.ContextTokenPath),
 		cursorStore:   store.NewCursorStore(o.AccountID, o.CursorPath),
 		hooks:         LifecycleHooks{},
+		logger:        logger,
 	}
 }
 
@@ -540,14 +551,19 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 
 	// Image
 	if content.Image != nil {
-		result, err := b.cdnUpload(ctx, creds, content.Image, userID, int(MediaImage))
+		thumbData, _ := thumb.FromImage(content.Image)
+		if thumbData == nil {
+			thumbData = thumb.Placeholder()
+		}
+		result, err := b.cdnUploadWithThumb(ctx, creds, content.Image, thumbData, userID, int(MediaImage))
 		if err != nil {
 			return err
 		}
 		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
 			"type": 2, "image_item": map[string]interface{}{
-				"media":    cdnMediaMap(&result.Media),
-				"mid_size": result.EncryptedFileSize,
+				"media":       cdnMediaMap(&result.Media),
+				"thumb_media": cdnMediaMap(&result.ThumbMedia),
+				"mid_size":    result.EncryptedFileSize,
 			},
 		}})
 		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
@@ -555,14 +571,19 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 
 	// Video
 	if content.Video != nil {
-		result, err := b.cdnUpload(ctx, creds, content.Video, userID, int(MediaVideo))
+		thumbData, _ := thumb.FromImage(content.Video)
+		if thumbData == nil {
+			thumbData = thumb.Placeholder()
+		}
+		result, err := b.cdnUploadWithThumb(ctx, creds, content.Video, thumbData, userID, int(MediaVideo))
 		if err != nil {
 			return err
 		}
 		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
 			"type": 5, "video_item": map[string]interface{}{
-				"media":      cdnMediaMap(&result.Media),
-				"video_size": result.EncryptedFileSize,
+				"media":       cdnMediaMap(&result.Media),
+				"thumb_media": cdnMediaMap(&result.ThumbMedia),
+				"video_size":  result.EncryptedFileSize,
 			},
 		}})
 		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
@@ -648,6 +669,10 @@ func (b *Bot) cdnDownload(ctx context.Context, media *CDNMedia, aeskeyOverride s
 }
 
 func (b *Bot) cdnUpload(ctx context.Context, creds *auth.Credentials, data []byte, userID string, mediaType int) (*UploadResult, error) {
+	return b.cdnUploadWithThumb(ctx, creds, data, nil, userID, mediaType)
+}
+
+func (b *Bot) cdnUploadWithThumb(ctx context.Context, creds *auth.Credentials, data, thumbData []byte, userID string, mediaType int) (*UploadResult, error) {
 	aesKey, err := crypto.GenerateAESKey()
 	if err != nil {
 		return nil, fmt.Errorf("generate aes key: %w", err)
@@ -666,16 +691,32 @@ func (b *Bot) cdnUpload(ctx context.Context, creds *auth.Credentials, data []byt
 	rawMD5 := md5.Sum(data)
 	rawMD5Hex := hex.EncodeToString(rawMD5[:])
 
-	uploadResp, err := b.client.GetUploadURL(ctx, creds.BaseURL, creds.Token, protocol.GetUploadURLRequest{
+	thumbReq := protocol.GetUploadURLRequest{
 		FileKey:     fileKey,
 		MediaType:   mediaType,
 		ToUserID:    userID,
 		RawSize:     len(data),
 		RawFileMD5:  rawMD5Hex,
 		FileSize:    len(ciphertext),
-		NoNeedThumb: true,
+		NoNeedThumb: thumbData == nil,
 		AESKey:      crypto.EncodeAESKeyHex(aesKey),
-	})
+	}
+	var thumbAESKey []byte
+	if thumbData != nil {
+		thumbAESKey, err = crypto.GenerateAESKey()
+		if err != nil {
+			return nil, fmt.Errorf("generate thumb aes key: %w", err)
+		}
+		thumbCipher, err := crypto.EncryptAESECB(thumbData, thumbAESKey)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt thumb: %w", err)
+		}
+		thumbMD5 := md5.Sum(thumbData)
+		thumbReq.ThumbRawSize = len(thumbData)
+		thumbReq.ThumbFileMD5 = hex.EncodeToString(thumbMD5[:])
+		thumbReq.ThumbFileSize = len(thumbCipher)
+	}
+	uploadResp, err := b.client.GetUploadURL(ctx, creds.BaseURL, creds.Token, thumbReq)
 	if err != nil {
 		return nil, fmt.Errorf("getuploadurl: %w", err)
 	}
@@ -712,7 +753,7 @@ func (b *Bot) cdnUpload(ctx context.Context, creds *auth.Credentials, data []byt
 		return nil, fmt.Errorf("cdn upload succeeded but x-encrypted-param header missing")
 	}
 
-	return &UploadResult{
+	result := &UploadResult{
 		Media: CDNMedia{
 			EncryptQueryParam: encryptQueryParam,
 			AESKey:            crypto.EncodeAESKeyBase64(aesKey),
@@ -720,7 +761,45 @@ func (b *Bot) cdnUpload(ctx context.Context, creds *auth.Credentials, data []byt
 		},
 		AESKey:            aesKey,
 		EncryptedFileSize: len(ciphertext),
-	}, nil
+	}
+
+	if thumbData != nil && uploadResp.ThumbUploadParam != "" {
+		thumbCipher, err := crypto.EncryptAESECB(thumbData, thumbAESKey)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt thumb for upload: %w", err)
+		}
+		thumbURL := fmt.Sprintf("%s/upload?encrypted_query_param=%s&filekey=%s",
+			protocol.CDNBaseURL,
+			url.QueryEscape(uploadResp.ThumbUploadParam),
+			url.QueryEscape(fileKey+"_thumb"))
+		thumbReq, err := http.NewRequestWithContext(ctx, "POST", thumbURL, bytes.NewReader(thumbCipher))
+		if err != nil {
+			return nil, fmt.Errorf("thumb upload request: %w", err)
+		}
+		thumbReq.Header.Set("Content-Type", "application/octet-stream")
+		thumbResp, err := http.DefaultClient.Do(thumbReq)
+		if err != nil {
+			return nil, fmt.Errorf("thumb upload: %w", err)
+		}
+		defer thumbResp.Body.Close()
+		if thumbResp.StatusCode >= 400 {
+			errMsg := thumbResp.Header.Get("x-error-message")
+			if errMsg == "" {
+				errMsg = fmt.Sprintf("HTTP %d", thumbResp.StatusCode)
+			}
+			return nil, fmt.Errorf("thumb upload failed: %s", errMsg)
+		}
+		thumbParam := thumbResp.Header.Get("x-encrypted-param")
+		if thumbParam != "" {
+			result.ThumbMedia = CDNMedia{
+				EncryptQueryParam: thumbParam,
+				AESKey:            crypto.EncodeAESKeyBase64(thumbAESKey),
+				EncryptType:       1,
+			}
+		}
+	}
+
+	return result, nil
 }
 
 func cdnMediaMap(m *CDNMedia) map[string]interface{} {
@@ -878,12 +957,20 @@ func (b *Bot) log(level, format string, args ...interface{}) {
 	b.mu.Lock()
 	logger := b.logger
 	b.mu.Unlock()
-	msg := fmt.Sprintf(format, args...)
-	if logger != nil {
-		logger(level, msg)
-		return
+	if logger == nil {
+		logger = newDefaultLogger(b.opts.LogLevel)
 	}
-	fmt.Fprintf(os.Stderr, "[wechatbot] %s\n", msg)
+	msg := fmt.Sprintf(format, args...)
+	lvl := botlog.InfoLevel
+	switch level {
+	case "debug":
+		lvl = botlog.DebugLevel
+	case "warn":
+		lvl = botlog.WarnLevel
+	case "error":
+		lvl = botlog.ErrorLevel
+	}
+	logger.Log(lvl, msg)
 }
 
 // SetLogger replaces the default stderr logger with a custom implementation.
@@ -892,8 +979,43 @@ func (b *Bot) SetLogger(fn func(level, msg string)) {
 		return
 	}
 	b.mu.Lock()
-	b.logger = fn
+	b.logger = &legacyLogger{fn: fn}
 	b.mu.Unlock()
+}
+
+// SetStructuredLogger replaces the default logger with a structured logger.
+func (b *Bot) SetStructuredLogger(l *botlog.Logger) {
+	if l == nil {
+		return
+	}
+	b.mu.Lock()
+	b.logger = l
+	b.mu.Unlock()
+}
+
+type loggerAdapter interface {
+	Log(level botlog.Level, msg string, fields ...botlog.Field)
+}
+
+type legacyLogger struct {
+	fn func(level, msg string)
+}
+
+func (l *legacyLogger) Log(level botlog.Level, msg string, fields ...botlog.Field) {
+	l.fn(string(level), msg)
+}
+
+func newDefaultLogger(level string) loggerAdapter {
+	lvl := botlog.InfoLevel
+	switch level {
+	case "debug":
+		lvl = botlog.DebugLevel
+	case "warn":
+		lvl = botlog.WarnLevel
+	case "error":
+		lvl = botlog.ErrorLevel
+	}
+	return botlog.New(botlog.Options{Level: lvl})
 }
 
 func detectType(items []MessageItem) ContentType {

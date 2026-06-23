@@ -18,11 +18,14 @@ import (
 
 const (
 	DefaultBaseURL = "https://ilinkai.weixin.qq.com"
-	CDNBaseURL     = "https://novac2c.cdn.weixin.qq.com/c2c"
 	ChannelVersion = "0.1.0"
 	// iLink-App-Id header value.
 	iLinkAppID = "bot"
 )
+
+// CDNBaseURL is the fixed CDN endpoint.
+// It is a package-level var so tests can override it.
+var CDNBaseURL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
 // APIError is returned when the iLink API returns a non-zero ret or HTTP error.
 type APIError struct {
@@ -327,11 +330,14 @@ func (c *Client) GetUploadURL(ctx context.Context, baseURL, token string, req Ge
 		"media_type":    req.MediaType,
 		"to_user_id":    req.ToUserID,
 		"rawsize":       req.RawSize,
-		"rawfilemd5":    req.RawFileMD5,
-		"filesize":      req.FileSize,
-		"no_need_thumb": req.NoNeedThumb,
-		"aeskey":        req.AESKey,
-		"base_info":     c.baseInfo(),
+		"rawfilemd5":       req.RawFileMD5,
+		"filesize":         req.FileSize,
+		"thumb_rawsize":    req.ThumbRawSize,
+		"thumb_rawfilemd5": req.ThumbFileMD5,
+		"thumb_filesize":   req.ThumbFileSize,
+		"no_need_thumb":    req.NoNeedThumb,
+		"aeskey":           req.AESKey,
+		"base_info":        c.baseInfo(),
 	}
 	raw, err := c.apiPost(ctx, baseURL, "/ilink/bot/getuploadurl", token, body, 15*time.Second)
 	if err != nil {

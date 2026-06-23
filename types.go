@@ -210,6 +210,7 @@ type DownloadedMedia struct {
 // UploadResult is the result of uploading media to CDN.
 type UploadResult struct {
 	Media             CDNMedia
+	ThumbMedia        CDNMedia
 	AESKey            []byte
 	EncryptedFileSize int
 }
