@@ -17,9 +17,17 @@ const maxDownloadBytes = 100 * 1024 * 1024
 // The context controls the request timeout/cancellation.
 // Downloads are capped at 100 MiB to avoid unbounded memory use.
 func Download(ctx context.Context, rawURL string) (data []byte, fileName string, err error) {
+	return DownloadWithClient(ctx, http.DefaultClient, rawURL)
+}
+
+// DownloadWithClient fetches a remote URL using the supplied HTTP client.
+func DownloadWithClient(ctx context.Context, client *http.Client, rawURL string) (data []byte, fileName string, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, "", fmt.Errorf("invalid remote URL %q", rawURL)
+	}
+	if client == nil {
+		client = http.DefaultClient
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -27,7 +35,7 @@ func Download(ctx context.Context, rawURL string) (data []byte, fileName string,
 		return nil, "", fmt.Errorf("create request: %w", err)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch remote media: %w", err)
 	}

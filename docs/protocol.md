@@ -8,7 +8,8 @@ CDN URL: `https://novac2c.cdn.weixin.qq.com/c2c`
 ### Step 1: Get QR Code
 
 ```
-GET /ilink/bot/get_bot_qrcode?bot_type=3
+POST /ilink/bot/get_bot_qrcode?bot_type=3
+Body: { local_token_list?: ["<previous_bot_token>"] }
 → { qrcode: "<token>", qrcode_img_content: "<url>" }
 ```
 
@@ -16,7 +17,7 @@ GET /ilink/bot/get_bot_qrcode?bot_type=3
 
 ```
 GET /ilink/bot/get_qrcode_status?qrcode=<token>
-Headers: { "iLink-App-ClientVersion": "1" }
+Headers: { "iLink-App-ClientVersion": "<computed_from_module_version>" }
 → { status: "wait" | "scaned" | "confirmed" | "expired", bot_token?, ilink_bot_id?, ilink_user_id?, baseurl? }
 ```
 
@@ -24,12 +25,14 @@ Headers: { "iLink-App-ClientVersion": "1" }
 
 ```
 Content-Type: application/json
+iLink-App-Id: bot
+iLink-App-ClientVersion: <computed_from_module_version>
 AuthorizationType: ilink_bot_token
 Authorization: Bearer <bot_token>
 X-WECHAT-UIN: <base64(String(randomUint32))>
 ```
 
-All POST bodies include: `base_info: { channel_version: "<version>" }`
+All POST bodies include: `base_info: { channel_version: "<module_version>", bot_agent?: "<agent>" }`. Development builds fall back to `0.3.0`.
 
 ## Get Updates (Long Poll)
 

@@ -18,7 +18,7 @@ import (
 
 const (
 	DefaultBaseURL = "https://ilinkai.weixin.qq.com"
-	ChannelVersion = "0.1.0"
+	ChannelVersion = "0.3.0"
 	// iLink-App-Id header value.
 	iLinkAppID = "bot"
 )
@@ -140,10 +140,16 @@ func (c *Client) GetQRCode(ctx context.Context, baseURL string, localTokenList [
 	}
 	var bodyReader io.Reader
 	if len(body) > 0 {
-		data, _ := json.Marshal(body)
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("get_bot_qrcode encode: %w", err)
+		}
 		bodyReader = bytes.NewReader(data)
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, u, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("get_bot_qrcode request: %w", err)
+	}
 	for k, v := range c.CommonHeaders() {
 		req.Header[k] = v
 	}
@@ -155,6 +161,10 @@ func (c *Client) GetQRCode(ctx context.Context, baseURL string, localTokenList [
 		return nil, fmt.Errorf("get_bot_qrcode: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		return nil, &APIError{Message: string(raw), HTTPStatus: resp.StatusCode}
+	}
 	var result QRCodeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("get_bot_qrcode decode: %w", err)
@@ -169,7 +179,10 @@ func (c *Client) PollQRStatus(ctx context.Context, baseURL, qrcode, verifyCode s
 	if verifyCode != "" {
 		u += "&verify_code=" + url.QueryEscape(verifyCode)
 	}
-	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("get_qrcode_status request: %w", err)
+	}
 	for k, v := range c.CommonHeaders() {
 		req.Header[k] = v
 	}
@@ -178,19 +191,31 @@ func (c *Client) PollQRStatus(ctx context.Context, baseURL, qrcode, verifyCode s
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		return nil, &APIError{Message: string(raw), HTTPStatus: resp.StatusCode}
+	}
 	var result QRStatusResponse
-	json.NewDecoder(resp.Body).Decode(&result)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("get_qrcode_status decode: %w", err)
+	}
 	return &result, nil
 }
 
 // apiPost sends a POST to the iLink API and parses the response.
 func (c *Client) apiPost(ctx context.Context, baseURL, endpoint, token string, body interface{}, timeout time.Duration) (json.RawMessage, error) {
-	data, _ := json.Marshal(body)
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("%s encode: %w", endpoint, err)
+	}
 	u := baseURL + endpoint
 	httpCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, _ := http.NewRequestWithContext(httpCtx, "POST", u, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(httpCtx, "POST", u, bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("%s request: %w", endpoint, err)
+	}
 	for k, v := range c.AuthHeaders(token) {
 		req.Header[k] = v
 	}
@@ -201,7 +226,10 @@ func (c *Client) apiPost(ctx context.Context, baseURL, endpoint, token string, b
 	}
 	defer resp.Body.Close()
 
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%s read response: %w", endpoint, err)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, &APIError{Message: string(raw), HTTPStatus: resp.StatusCode}
 	}
@@ -212,7 +240,9 @@ func (c *Client) apiPost(ctx context.Context, baseURL, endpoint, token string, b
 		ErrCode int    `json:"errcode"`
 		ErrMsg  string `json:"errmsg"`
 	}
-	json.Unmarshal(raw, &check)
+	if err := json.Unmarshal(raw, &check); err != nil {
+		return nil, fmt.Errorf("%s decode response: %w", endpoint, err)
+	}
 	if check.Ret != 0 || check.ErrCode != 0 {
 		code := check.ErrCode
 		if code == 0 {
@@ -240,7 +270,9 @@ func (c *Client) GetUpdates(ctx context.Context, baseURL, token, cursor string, 
 		return nil, err
 	}
 	var result GetUpdatesResponse
-	json.Unmarshal(raw, &result)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("getupdates decode: %w", err)
+	}
 	return &result, nil
 }
 
@@ -266,7 +298,9 @@ func (c *Client) GetConfig(ctx context.Context, baseURL, token, userID, contextT
 		return nil, err
 	}
 	var result GetConfigResponse
-	json.Unmarshal(raw, &result)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("getconfig decode: %w", err)
+	}
 	return &result, nil
 }
 
@@ -358,7 +392,10 @@ func (c *Client) UploadToCDN(ctx context.Context, cdnURL string, ciphertext []by
 	var lastErr error
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequestWithContext(ctx, "POST", cdnURL, bytes.NewReader(ciphertext))
+		req, err := http.NewRequestWithContext(ctx, "POST", cdnURL, bytes.NewReader(ciphertext))
+		if err != nil {
+			return "", fmt.Errorf("CDN upload request: %w", err)
+		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 
 		resp, err := c.HTTP.Do(req)
@@ -366,10 +403,9 @@ func (c *Client) UploadToCDN(ctx context.Context, cdnURL string, ciphertext []by
 			lastErr = fmt.Errorf("CDN upload attempt %d: %w", attempt, err)
 			continue
 		}
-		defer resp.Body.Close()
-
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			errMsg := resp.Header.Get("x-error-message")
+			resp.Body.Close()
 			if errMsg == "" {
 				errMsg = fmt.Sprintf("HTTP %d", resp.StatusCode)
 			}
@@ -377,11 +413,13 @@ func (c *Client) UploadToCDN(ctx context.Context, cdnURL string, ciphertext []by
 		}
 		if resp.StatusCode != 200 {
 			errMsg := resp.Header.Get("x-error-message")
+			resp.Body.Close()
 			lastErr = fmt.Errorf("CDN upload server error %d: %s", resp.StatusCode, errMsg)
 			continue
 		}
 
 		downloadParam := resp.Header.Get("x-encrypted-param")
+		resp.Body.Close()
 		if downloadParam == "" {
 			lastErr = fmt.Errorf("CDN upload response missing x-encrypted-param header")
 			continue

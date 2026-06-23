@@ -16,7 +16,7 @@
 go get github.com/Icatme/wechatbot-go
 ```
 
-要求 Go 1.22+，零 CGO 依赖。
+要求 Go 1.25+，零 CGO 依赖。
 
 ## 快速开始
 

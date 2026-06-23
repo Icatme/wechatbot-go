@@ -1,10 +1,19 @@
 package wechatbot
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"github.com/Icatme/wechatbot-go/internal/auth"
+	"github.com/Icatme/wechatbot-go/internal/crypto"
 )
 
 func TestChunkTextShort(t *testing.T) {
@@ -40,6 +49,22 @@ func TestChunkTextSplitsOnNewline(t *testing.T) {
 	}
 	if chunks[0] != "aaaa\n" || chunks[1] != "bbbb" {
 		t.Fatalf("unexpected chunks: %v", chunks)
+	}
+}
+
+func TestChunkTextPreservesUTF8(t *testing.T) {
+	text := strings.Repeat("你", maxTextChars+1)
+	chunks := chunkText(text, maxTextChars)
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(chunks))
+	}
+	for _, chunk := range chunks {
+		if !utf8.ValidString(chunk) {
+			t.Fatalf("chunk is not valid UTF-8: %q", chunk)
+		}
+		if runeLen(chunk) > maxTextChars {
+			t.Fatalf("chunk has %d runes, want <= %d", runeLen(chunk), maxTextChars)
+		}
 	}
 }
 
@@ -282,6 +307,93 @@ func TestRememberContextBot(t *testing.T) {
 	b.rememberContext(wire)
 	if ct := b.contextTokens.Get("user123"); ct != "ctx-bot" {
 		t.Fatalf("expected context token ctx-bot for toUserID, got %v", ct)
+	}
+}
+
+func TestReplyWithoutLoginReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	b := New(Options{ContextTokenPath: filepath.Join(dir, "context_tokens.json")})
+	err := b.Reply(context.Background(), &IncomingMessage{
+		UserID:       "user123",
+		ContextToken: "ctx",
+	}, "hello")
+	if err == nil || !strings.Contains(err.Error(), "not logged in") {
+		t.Fatalf("expected not logged in error, got %v", err)
+	}
+}
+
+func TestSendTypingWithoutLoginReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	b := New(Options{ContextTokenPath: filepath.Join(dir, "context_tokens.json")})
+	if err := b.contextTokens.Set("user123", "ctx"); err != nil {
+		t.Fatal(err)
+	}
+	err := b.SendTyping(context.Background(), "user123")
+	if err == nil || !strings.Contains(err.Error(), "not logged in") {
+		t.Fatalf("expected not logged in error, got %v", err)
+	}
+}
+
+func TestReplyContentWithoutLoginDoesNotDownloadRemote(t *testing.T) {
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		w.Write([]byte("image"))
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	b := New(Options{ContextTokenPath: filepath.Join(dir, "context_tokens.json")})
+	err := b.ReplyContent(context.Background(), &IncomingMessage{
+		UserID:       "user123",
+		ContextToken: "ctx",
+	}, SendImageURL(ts.URL))
+	if err == nil || !strings.Contains(err.Error(), "not logged in") {
+		t.Fatalf("expected not logged in error, got %v", err)
+	}
+	if called {
+		t.Fatal("remote URL should not be fetched before login check")
+	}
+}
+
+func TestSendBlockedWhenSessionPaused(t *testing.T) {
+	dir := t.TempDir()
+	b := New(Options{ContextTokenPath: filepath.Join(dir, "context_tokens.json")})
+	if err := b.contextTokens.Set("user123", "ctx"); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	b.creds = &auth.Credentials{BaseURL: "https://example.com", Token: "token"}
+	b.mu.Unlock()
+	b.sessionGuard.Pause()
+
+	err := b.Send(context.Background(), "user123", "hello")
+	if err == nil || !strings.Contains(err.Error(), "session paused") {
+		t.Fatalf("expected session paused error, got %v", err)
+	}
+}
+
+func TestDownloadRawUsesFullURL(t *testing.T) {
+	key := []byte("1234567890abcdef")
+	ciphertext, err := crypto.EncryptAESECB([]byte("hello"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(ciphertext)
+	}))
+	defer ts.Close()
+
+	b := New()
+	data, err := b.DownloadRaw(context.Background(), &CDNMedia{
+		FullURL: ts.URL,
+		AESKey:  crypto.EncodeAESKeyBase64(key),
+	}, "")
+	if err != nil {
+		t.Fatalf("DownloadRaw failed: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("expected hello, got %q", data)
 	}
 }
 

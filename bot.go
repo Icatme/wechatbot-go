@@ -1,7 +1,6 @@
 package wechatbot
 
 import (
-	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
@@ -128,11 +127,20 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 	b.mu.Lock()
 	b.creds = creds
 	b.opts.BaseURL = creds.BaseURL
+	if b.opts.AccountID == "" {
+		b.opts.AccountID = creds.AccountID
+	}
 	b.configCache = config.NewCache(config.APIOpts{
 		BaseURL: creds.BaseURL,
 		Token:   creds.Token,
 		Client:  b.client,
 	})
+	if b.opts.ContextTokenPath == "" {
+		b.contextTokens = store.NewContextStore(b.opts.AccountID, "")
+	}
+	if b.opts.CursorPath == "" {
+		b.cursorStore = store.NewCursorStore(b.opts.AccountID, "")
+	}
 	b.mu.Unlock()
 
 	if loadErr := b.contextTokens.Load(); loadErr != nil {
@@ -200,8 +208,11 @@ func (b *Bot) SendTyping(ctx context.Context, userID string) error {
 	if ct == "" {
 		return fmt.Errorf("no context_token for user %s", userID)
 	}
-	creds := b.getCreds()
-	cfg, err := b.configCache.GetForUser(ctx, userID, ct)
+	creds, configCache, err := b.readyConfig()
+	if err != nil {
+		return err
+	}
+	cfg, err := configCache.GetForUser(ctx, userID, ct)
 	if err != nil {
 		return err
 	}
@@ -217,8 +228,11 @@ func (b *Bot) StopTyping(ctx context.Context, userID string) error {
 	if ct == "" {
 		return nil
 	}
-	creds := b.getCreds()
-	cfg, err := b.configCache.GetForUser(ctx, userID, ct)
+	creds, configCache, err := b.readyConfig()
+	if err != nil {
+		return err
+	}
+	cfg, err := configCache.GetForUser(ctx, userID, ct)
 	if err != nil {
 		return err
 	}
@@ -250,9 +264,9 @@ type SendContent struct {
 
 // resolveRemote downloads remote media when ImageURL/VideoURL/FileURL is set,
 // returning a SendContent backed by local bytes.
-func (content SendContent) resolveRemote(ctx context.Context) (SendContent, error) {
+func (content SendContent) resolveRemote(ctx context.Context, httpClient *http.Client) (SendContent, error) {
 	if content.ImageURL != "" {
-		data, _, err := remote.Download(ctx, content.ImageURL)
+		data, _, err := remote.DownloadWithClient(ctx, httpClient, content.ImageURL)
 		if err != nil {
 			return content, fmt.Errorf("download image: %w", err)
 		}
@@ -260,7 +274,7 @@ func (content SendContent) resolveRemote(ctx context.Context) (SendContent, erro
 		content.ImageURL = ""
 	}
 	if content.VideoURL != "" {
-		data, _, err := remote.Download(ctx, content.VideoURL)
+		data, _, err := remote.DownloadWithClient(ctx, httpClient, content.VideoURL)
 		if err != nil {
 			return content, fmt.Errorf("download video: %w", err)
 		}
@@ -268,7 +282,7 @@ func (content SendContent) resolveRemote(ctx context.Context) (SendContent, erro
 		content.VideoURL = ""
 	}
 	if content.FileURL != "" {
-		data, name, err := remote.Download(ctx, content.FileURL)
+		data, name, err := remote.DownloadWithClient(ctx, httpClient, content.FileURL)
 		if err != nil {
 			return content, fmt.Errorf("download file: %w", err)
 		}
@@ -311,7 +325,10 @@ func (b *Bot) ReplyContent(ctx context.Context, msg *IncomingMessage, content Se
 	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
 		b.log("warn", "failed to persist context token: %v", err)
 	}
-	resolved, err := content.resolveRemote(ctx)
+	if _, err := b.readyCreds(); err != nil {
+		return err
+	}
+	resolved, err := content.resolveRemote(ctx, b.client.HTTP)
 	if err != nil {
 		return err
 	}
@@ -328,7 +345,10 @@ func (b *Bot) SendMedia(ctx context.Context, userID string, content SendContent)
 	if ct == "" {
 		return fmt.Errorf("no context_token for user %s", userID)
 	}
-	resolved, err := content.resolveRemote(ctx)
+	if _, err := b.readyCreds(); err != nil {
+		return err
+	}
+	resolved, err := content.resolveRemote(ctx, b.client.HTTP)
 	if err != nil {
 		return err
 	}
@@ -388,9 +408,9 @@ func (b *Bot) DownloadRaw(ctx context.Context, media *CDNMedia, aeskeyOverride s
 
 // Upload uploads data to WeChat CDN without sending a message.
 func (b *Bot) Upload(ctx context.Context, data []byte, userID string, mediaType int) (*UploadResult, error) {
-	creds := b.getCreds()
-	if creds == nil {
-		return nil, fmt.Errorf("not logged in; call Login() first")
+	creds, err := b.readyCreds()
+	if err != nil {
+		return nil, err
 	}
 	return b.cdnUpload(ctx, creds, data, userID, mediaType)
 }
@@ -527,6 +547,31 @@ func (b *Bot) Stop() {
 
 // --- internal ---
 
+func (b *Bot) readyCreds() (*auth.Credentials, error) {
+	if err := b.sessionGuard.AssertActive(); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.creds == nil {
+		return nil, fmt.Errorf("not logged in; call Login() first")
+	}
+	return b.creds, nil
+}
+
+func (b *Bot) readyConfig() (*auth.Credentials, *config.Cache, error) {
+	creds, err := b.readyCreds()
+	if err != nil {
+		return nil, nil, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.configCache == nil {
+		return nil, nil, fmt.Errorf("not logged in; call Login() first")
+	}
+	return creds, b.configCache, nil
+}
+
 func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, content SendContent) error {
 	if err := b.hooks.BeforeSend.Run(&content); err != nil {
 		return fmt.Errorf("BeforeSend hook failed: %w", err)
@@ -630,14 +675,23 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 }
 
 func (b *Bot) cdnDownload(ctx context.Context, media *CDNMedia, aeskeyOverride string) ([]byte, error) {
-	downloadURL := fmt.Sprintf("%s/download?encrypted_query_param=%s",
-		protocol.CDNBaseURL, url.QueryEscape(media.EncryptQueryParam))
+	if media == nil {
+		return nil, fmt.Errorf("missing CDN media")
+	}
+	downloadURL := media.FullURL
+	if downloadURL == "" {
+		if media.EncryptQueryParam == "" {
+			return nil, fmt.Errorf("missing CDN encrypted_query_param")
+		}
+		downloadURL = fmt.Sprintf("%s/download?encrypted_query_param=%s",
+			protocol.CDNBaseURL, url.QueryEscape(media.EncryptQueryParam))
+	}
 
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("cdn download request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := b.client.HTTP.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cdn download: %w", err)
 	}
@@ -724,37 +778,17 @@ func (b *Bot) cdnUploadWithThumb(ctx context.Context, creds *auth.Credentials, d
 	if err != nil {
 		return nil, fmt.Errorf("getuploadurl: %w", err)
 	}
-	if uploadResp.UploadParam == "" {
-		return nil, fmt.Errorf("getuploadurl did not return upload_param")
+	uploadURL := uploadResp.UploadFullURL
+	if uploadURL == "" {
+		if uploadResp.UploadParam == "" {
+			return nil, fmt.Errorf("getuploadurl did not return upload_param")
+		}
+		uploadURL = protocol.BuildCDNUploadURL(protocol.CDNBaseURL, uploadResp.UploadParam, fileKey)
 	}
 
-	uploadURL := fmt.Sprintf("%s/upload?encrypted_query_param=%s&filekey=%s",
-		protocol.CDNBaseURL,
-		url.QueryEscape(uploadResp.UploadParam),
-		url.QueryEscape(fileKey))
-
-	req, err := http.NewRequestWithContext(ctx, "POST", uploadURL, bytes.NewReader(ciphertext))
-	if err != nil {
-		return nil, fmt.Errorf("cdn upload request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := http.DefaultClient.Do(req)
+	encryptQueryParam, err := b.client.UploadToCDN(ctx, uploadURL, ciphertext)
 	if err != nil {
 		return nil, fmt.Errorf("cdn upload: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		errMsg := resp.Header.Get("x-error-message")
-		if errMsg == "" {
-			errMsg = fmt.Sprintf("HTTP %d", resp.StatusCode)
-		}
-		return nil, fmt.Errorf("cdn upload failed: %s", errMsg)
-	}
-
-	encryptQueryParam := resp.Header.Get("x-encrypted-param")
-	if encryptQueryParam == "" {
-		return nil, fmt.Errorf("cdn upload succeeded but x-encrypted-param header missing")
 	}
 
 	result := &UploadResult{
@@ -772,28 +806,11 @@ func (b *Bot) cdnUploadWithThumb(ctx context.Context, creds *auth.Credentials, d
 		if err != nil {
 			return nil, fmt.Errorf("encrypt thumb for upload: %w", err)
 		}
-		thumbURL := fmt.Sprintf("%s/upload?encrypted_query_param=%s&filekey=%s",
-			protocol.CDNBaseURL,
-			url.QueryEscape(uploadResp.ThumbUploadParam),
-			url.QueryEscape(fileKey+"_thumb"))
-		thumbReq, err := http.NewRequestWithContext(ctx, "POST", thumbURL, bytes.NewReader(thumbCipher))
-		if err != nil {
-			return nil, fmt.Errorf("thumb upload request: %w", err)
-		}
-		thumbReq.Header.Set("Content-Type", "application/octet-stream")
-		thumbResp, err := http.DefaultClient.Do(thumbReq)
+		thumbURL := protocol.BuildCDNUploadURL(protocol.CDNBaseURL, uploadResp.ThumbUploadParam, fileKey+"_thumb")
+		thumbParam, err := b.client.UploadToCDN(ctx, thumbURL, thumbCipher)
 		if err != nil {
 			return nil, fmt.Errorf("thumb upload: %w", err)
 		}
-		defer thumbResp.Body.Close()
-		if thumbResp.StatusCode >= 400 {
-			errMsg := thumbResp.Header.Get("x-error-message")
-			if errMsg == "" {
-				errMsg = fmt.Sprintf("HTTP %d", thumbResp.StatusCode)
-			}
-			return nil, fmt.Errorf("thumb upload failed: %s", errMsg)
-		}
-		thumbParam := thumbResp.Header.Get("x-encrypted-param")
 		if thumbParam != "" {
 			result.ThumbMedia = CDNMedia{
 				EncryptQueryParam: thumbParam,
@@ -814,7 +831,10 @@ func cdnMediaMap(m *CDNMedia) map[string]interface{} {
 	}
 }
 
-const maxDownloadBytes = 100 * 1024 * 1024
+const (
+	maxDownloadBytes = 100 * 1024 * 1024
+	maxTextChars     = 2000
+)
 
 var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true, ".bmp": true, ".svg": true}
 var videoExts = map[string]bool{".mp4": true, ".mov": true, ".webm": true, ".mkv": true, ".avi": true}
@@ -831,11 +851,14 @@ func categorizeByExtension(filename string) string {
 }
 
 func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) error {
-	creds := b.getCreds()
+	creds, err := b.readyCreds()
+	if err != nil {
+		return err
+	}
 	if b.opts.StripMarkdown {
 		text = markdown.StripMarkdown(text)
 	}
-	chunks := chunkText(text, 4000)
+	chunks := chunkText(text, maxTextChars)
 	for _, chunk := range chunks {
 		msg := protocol.BuildTextMessage(userID, contextToken, chunk)
 		if err := b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg); err != nil {
@@ -849,6 +872,9 @@ func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) e
 // Errors are best-effort; failures to send the notice are logged but not returned.
 func (b *Bot) notifyError(ctx context.Context, userID, contextToken string, err error) {
 	if !b.opts.NotifyErrors {
+		return
+	}
+	if b.sessionGuard.AssertActive() != nil {
 		return
 	}
 	creds := b.getCreds()
@@ -1074,21 +1100,25 @@ func extractText(items []MessageItem) string {
 }
 
 func chunkText(text string, limit int) []string {
-	if len(text) <= limit {
+	if limit <= 0 {
+		return []string{text}
+	}
+	if runeLen(text) <= limit {
 		return []string{text}
 	}
 	var chunks []string
 	for len(text) > 0 {
-		if len(text) <= limit {
+		if runeLen(text) <= limit {
 			chunks = append(chunks, text)
 			break
 		}
-		cut := limit
-		if idx := strings.LastIndex(text[:limit], "\n\n"); idx > limit*3/10 {
+		prefix := firstRunes(text, limit)
+		cut := len(prefix)
+		if idx := strings.LastIndex(prefix, "\n\n"); idx >= 0 && runeLen(prefix[:idx]) > limit*3/10 {
 			cut = idx + 2
-		} else if idx := strings.LastIndex(text[:limit], "\n"); idx > limit*3/10 {
+		} else if idx := strings.LastIndex(prefix, "\n"); idx >= 0 && runeLen(prefix[:idx]) > limit*3/10 {
 			cut = idx + 1
-		} else if idx := strings.LastIndex(text[:limit], " "); idx > limit*3/10 {
+		} else if idx := strings.LastIndex(prefix, " "); idx >= 0 && runeLen(prefix[:idx]) > limit*3/10 {
 			cut = idx + 1
 		}
 		chunks = append(chunks, text[:cut])
@@ -1098,6 +1128,25 @@ func chunkText(text string, limit int) []string {
 		return []string{""}
 	}
 	return chunks
+}
+
+func firstRunes(text string, limit int) string {
+	count := 0
+	for idx := range text {
+		if count == limit {
+			return text[:idx]
+		}
+		count++
+	}
+	return text
+}
+
+func runeLen(text string) int {
+	count := 0
+	for range text {
+		count++
+	}
+	return count
 }
 
 func min(a, b time.Duration) time.Duration {
