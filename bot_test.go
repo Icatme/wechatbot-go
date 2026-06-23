@@ -266,8 +266,7 @@ func TestRememberContextUser(t *testing.T) {
 		ContextToken: "ctx-new",
 	}
 	b.rememberContext(wire)
-	ct, ok := b.contextTokens.Load("user123")
-	if !ok || ct.(string) != "ctx-new" {
+	if ct := b.contextTokens.Get("user123"); ct != "ctx-new" {
 		t.Fatalf("expected context token ctx-new, got %v", ct)
 	}
 }
@@ -281,8 +280,7 @@ func TestRememberContextBot(t *testing.T) {
 		ContextToken: "ctx-bot",
 	}
 	b.rememberContext(wire)
-	ct, ok := b.contextTokens.Load("user123")
-	if !ok || ct.(string) != "ctx-bot" {
+	if ct := b.contextTokens.Get("user123"); ct != "ctx-bot" {
 		t.Fatalf("expected context token ctx-bot for toUserID, got %v", ct)
 	}
 }

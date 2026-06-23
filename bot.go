@@ -21,6 +21,7 @@ import (
 	"github.com/Icatme/wechatbot-go/internal/auth"
 	"github.com/Icatme/wechatbot-go/internal/crypto"
 	"github.com/Icatme/wechatbot-go/internal/protocol"
+	"github.com/Icatme/wechatbot-go/internal/store"
 )
 
 // MessageHandler is called for each incoming user message.
@@ -28,13 +29,15 @@ type MessageHandler func(msg *IncomingMessage)
 
 // Options configures a Bot instance.
 type Options struct {
-	BaseURL      string
-	CredPath     string
-	LogLevel     string // "debug", "info", "warn", "error", "silent"
-	OnQRURL      func(url string)
-	OnScanned    func()
-	OnExpired    func()
-	OnError      func(err error)
+	BaseURL          string
+	CredPath         string
+	ContextTokenPath string
+	CursorPath       string
+	LogLevel         string // "debug", "info", "warn", "error", "silent"
+	OnQRURL          func(url string)
+	OnScanned        func()
+	OnExpired        func()
+	OnError          func(err error)
 }
 
 // Bot is the main WeChat bot client.
@@ -43,8 +46,8 @@ type Bot struct {
 	client        *protocol.Client
 	creds         *auth.Credentials
 	handlers      []MessageHandler
-	contextTokens sync.Map // map[string]string
-	cursor        string
+	contextTokens *store.ContextStore
+	cursorStore   *store.CursorStore
 	stopped       bool
 	mu            sync.Mutex
 	cancelPoll    context.CancelFunc
@@ -60,8 +63,10 @@ func New(opts ...Options) *Bot {
 		o.BaseURL = protocol.DefaultBaseURL
 	}
 	return &Bot{
-		opts:   o,
-		client: protocol.NewClient(),
+		opts:          o,
+		client:        protocol.NewClient(),
+		contextTokens: store.NewContextStore(o.ContextTokenPath),
+		cursorStore:   store.NewCursorStore(o.CursorPath),
 	}
 }
 
@@ -84,6 +89,10 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 	b.opts.BaseURL = creds.BaseURL
 	b.mu.Unlock()
 
+	if loadErr := b.contextTokens.Load(); loadErr != nil {
+		b.log("warn", "Failed to load context tokens: %v", loadErr)
+	}
+
 	b.log("info", "Logged in as %s", creds.UserID)
 
 	return &Credentials{
@@ -102,27 +111,29 @@ func (b *Bot) OnMessage(handler MessageHandler) {
 
 // Reply sends a text reply to an incoming message.
 func (b *Bot) Reply(ctx context.Context, msg *IncomingMessage, text string) error {
-	b.contextTokens.Store(msg.UserID, msg.ContextToken)
+	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
+		b.log("warn", "failed to persist context token: %v", err)
+	}
 	return b.sendText(ctx, msg.UserID, text, msg.ContextToken)
 }
 
 // Send sends a text message to a user (requires prior context_token).
 func (b *Bot) Send(ctx context.Context, userID, text string) error {
-	ct, ok := b.contextTokens.Load(userID)
-	if !ok {
+	ct := b.contextTokens.Get(userID)
+	if ct == "" {
 		return fmt.Errorf("no context_token for user %s", userID)
 	}
-	return b.sendText(ctx, userID, text, ct.(string))
+	return b.sendText(ctx, userID, text, ct)
 }
 
 // SendTyping shows the "typing..." indicator.
 func (b *Bot) SendTyping(ctx context.Context, userID string) error {
-	ct, ok := b.contextTokens.Load(userID)
-	if !ok {
+	ct := b.contextTokens.Get(userID)
+	if ct == "" {
 		return fmt.Errorf("no context_token for user %s", userID)
 	}
 	creds := b.getCreds()
-	config, err := b.client.GetConfig(ctx, creds.BaseURL, creds.Token, userID, ct.(string))
+	config, err := b.client.GetConfig(ctx, creds.BaseURL, creds.Token, userID, ct)
 	if err != nil {
 		return err
 	}
@@ -134,12 +145,12 @@ func (b *Bot) SendTyping(ctx context.Context, userID string) error {
 
 // StopTyping cancels the "typing..." indicator.
 func (b *Bot) StopTyping(ctx context.Context, userID string) error {
-	ct, ok := b.contextTokens.Load(userID)
-	if !ok {
+	ct := b.contextTokens.Get(userID)
+	if ct == "" {
 		return nil
 	}
 	creds := b.getCreds()
-	config, err := b.client.GetConfig(ctx, creds.BaseURL, creds.Token, userID, ct.(string))
+	config, err := b.client.GetConfig(ctx, creds.BaseURL, creds.Token, userID, ct)
 	if err != nil {
 		return err
 	}
@@ -179,17 +190,19 @@ func SendFile(data []byte, fileName string) SendContent {
 
 // ReplyContent replies with any content type.
 func (b *Bot) ReplyContent(ctx context.Context, msg *IncomingMessage, content SendContent) error {
-	b.contextTokens.Store(msg.UserID, msg.ContextToken)
+	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
+		b.log("warn", "failed to persist context token: %v", err)
+	}
 	return b.sendContent(ctx, msg.UserID, msg.ContextToken, content)
 }
 
 // SendMedia sends any content type to a user.
 func (b *Bot) SendMedia(ctx context.Context, userID string, content SendContent) error {
-	ct, ok := b.contextTokens.Load(userID)
-	if !ok {
+	ct := b.contextTokens.Get(userID)
+	if ct == "" {
 		return fmt.Errorf("no context_token for user %s", userID)
 	}
-	return b.sendContent(ctx, userID, ct.(string), content)
+	return b.sendContent(ctx, userID, ct, content)
 }
 
 // Download downloads media from an incoming message.
@@ -262,6 +275,9 @@ func (b *Bot) Run(ctx context.Context) error {
 	b.mu.Unlock()
 
 	b.log("info", "Long-poll loop started")
+	if loadErr := b.cursorStore.Load(); loadErr != nil {
+		b.log("warn", "Failed to load cursor: %v", loadErr)
+	}
 	retryDelay := time.Second
 
 	for {
@@ -273,7 +289,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 
 		creds = b.getCreds()
-		updates, err := b.client.GetUpdates(pollCtx, creds.BaseURL, creds.Token, b.cursor)
+		updates, err := b.client.GetUpdates(pollCtx, creds.BaseURL, creds.Token, b.cursorStore.Get())
 		if err != nil {
 			if pollCtx.Err() != nil {
 				b.log("info", "Long-poll loop stopped")
@@ -284,8 +300,8 @@ func (b *Bot) Run(ctx context.Context) error {
 			if isAPI && apiErr.IsSessionExpired() {
 				b.log("warn", "Session expired — re-login required")
 				auth.ClearCredentials(b.opts.CredPath)
-				b.contextTokens = sync.Map{}
-				b.cursor = ""
+				_ = b.contextTokens.Clear()
+				_ = b.cursorStore.Clear()
 				if _, loginErr := b.Login(pollCtx, true); loginErr != nil {
 					b.reportError(loginErr)
 					time.Sleep(retryDelay)
@@ -302,7 +318,9 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 
 		if updates.GetUpdatesBuf != "" {
-			b.cursor = updates.GetUpdatesBuf
+			if saveErr := b.cursorStore.Set(updates.GetUpdatesBuf); saveErr != nil {
+				b.log("warn", "Failed to save cursor: %v", saveErr)
+			}
 		}
 		retryDelay = time.Second
 
@@ -582,7 +600,9 @@ func (b *Bot) rememberContext(wire *WireMessage) {
 		userID = wire.ToUserID
 	}
 	if userID != "" && wire.ContextToken != "" {
-		b.contextTokens.Store(userID, wire.ContextToken)
+		if err := b.contextTokens.Set(userID, wire.ContextToken); err != nil {
+			b.log("warn", "failed to persist context token: %v", err)
+		}
 	}
 }
 
