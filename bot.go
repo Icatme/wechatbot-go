@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/Icatme/wechatbot-go/internal/auth"
+	"github.com/Icatme/wechatbot-go/internal/config"
 	"github.com/Icatme/wechatbot-go/internal/crypto"
 	"github.com/Icatme/wechatbot-go/internal/protocol"
+	"github.com/Icatme/wechatbot-go/internal/session"
 	"github.com/Icatme/wechatbot-go/internal/store"
 )
 
@@ -45,6 +47,8 @@ type Bot struct {
 	opts          Options
 	client        *protocol.Client
 	creds         *auth.Credentials
+	configCache   *config.Cache
+	sessionGuard  *session.Guard
 	handlers      []MessageHandler
 	contextTokens *store.ContextStore
 	cursorStore   *store.CursorStore
@@ -65,6 +69,7 @@ func New(opts ...Options) *Bot {
 	return &Bot{
 		opts:          o,
 		client:        protocol.NewClient(),
+		sessionGuard:  session.NewGuard(),
 		contextTokens: store.NewContextStore(o.ContextTokenPath),
 		cursorStore:   store.NewCursorStore(o.CursorPath),
 	}
@@ -87,6 +92,11 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 	b.mu.Lock()
 	b.creds = creds
 	b.opts.BaseURL = creds.BaseURL
+	b.configCache = config.NewCache(config.APIOpts{
+		BaseURL: creds.BaseURL,
+		Token:   creds.Token,
+		Client:  b.client,
+	})
 	b.mu.Unlock()
 
 	if loadErr := b.contextTokens.Load(); loadErr != nil {
@@ -133,14 +143,14 @@ func (b *Bot) SendTyping(ctx context.Context, userID string) error {
 		return fmt.Errorf("no context_token for user %s", userID)
 	}
 	creds := b.getCreds()
-	config, err := b.client.GetConfig(ctx, creds.BaseURL, creds.Token, userID, ct)
+	cfg, err := b.configCache.GetForUser(ctx, userID, ct)
 	if err != nil {
 		return err
 	}
-	if config.TypingTicket == "" {
+	if cfg.TypingTicket == "" {
 		return nil
 	}
-	return b.client.SendTyping(ctx, creds.BaseURL, creds.Token, userID, config.TypingTicket, 1)
+	return b.client.SendTyping(ctx, creds.BaseURL, creds.Token, userID, cfg.TypingTicket, 1)
 }
 
 // StopTyping cancels the "typing..." indicator.
@@ -150,14 +160,14 @@ func (b *Bot) StopTyping(ctx context.Context, userID string) error {
 		return nil
 	}
 	creds := b.getCreds()
-	config, err := b.client.GetConfig(ctx, creds.BaseURL, creds.Token, userID, ct)
+	cfg, err := b.configCache.GetForUser(ctx, userID, ct)
 	if err != nil {
 		return err
 	}
-	if config.TypingTicket == "" {
+	if cfg.TypingTicket == "" {
 		return nil
 	}
-	return b.client.SendTyping(ctx, creds.BaseURL, creds.Token, userID, config.TypingTicket, 2)
+	return b.client.SendTyping(ctx, creds.BaseURL, creds.Token, userID, cfg.TypingTicket, 2)
 }
 
 // SendContent describes what to send. Use one of:
@@ -288,6 +298,17 @@ func (b *Bot) Run(ctx context.Context) error {
 		default:
 		}
 
+		if remaining := b.sessionGuard.Remaining(); remaining > 0 {
+			b.log("warn", "Session paused, waiting %v", remaining.Round(time.Second))
+			select {
+			case <-pollCtx.Done():
+				b.log("info", "Long-poll loop stopped")
+				return nil
+			case <-time.After(remaining):
+				continue
+			}
+		}
+
 		creds = b.getCreds()
 		updates, err := b.client.GetUpdates(pollCtx, creds.BaseURL, creds.Token, b.cursorStore.Get())
 		if err != nil {
@@ -298,15 +319,8 @@ func (b *Bot) Run(ctx context.Context) error {
 
 			apiErr, isAPI := err.(*protocol.APIError)
 			if isAPI && apiErr.IsSessionExpired() {
-				b.log("warn", "Session expired — re-login required")
-				auth.ClearCredentials(b.opts.CredPath)
-				_ = b.contextTokens.Clear()
-				_ = b.cursorStore.Clear()
-				if _, loginErr := b.Login(pollCtx, true); loginErr != nil {
-					b.reportError(loginErr)
-					time.Sleep(retryDelay)
-					continue
-				}
+				b.log("warn", "Session expired — pausing for %v", session.PauseDuration)
+				b.sessionGuard.Pause()
 				retryDelay = time.Second
 				continue
 			}
