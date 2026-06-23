@@ -13,7 +13,7 @@
 ## 安装
 
 ```bash
-go get github.com/icatme/wechatbot-go
+go get github.com/Icatme/wechatbot-go
 ```
 
 要求 Go 1.22+，零 CGO 依赖。
@@ -30,7 +30,7 @@ import (
     "os/signal"
     "syscall"
 
-    "github.com/icatme/wechatbot-go"
+    "github.com/Icatme/wechatbot-go"
 )
 
 func main() {
@@ -74,7 +74,7 @@ func main() {
 ## 与原仓库的关系
 
 - 原仓库：`github.com/corespeed-io/wechatbot`（多语言）
-- 本仓库：`github.com/icatme/wechatbot-go`（仅 Go）
+- 本仓库：`github.com/Icatme/wechatbot-go`（仅 Go）
 - 许可证：MIT（保留原项目版权声明）
 
 ## 贡献

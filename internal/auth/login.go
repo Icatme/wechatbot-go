@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/icatme/wechatbot-go/internal/protocol"
+	"github.com/Icatme/wechatbot-go/internal/protocol"
 )
 
 // Credentials holds bot authentication data.

@@ -18,9 +18,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/icatme/wechatbot-go/internal/auth"
-	"github.com/icatme/wechatbot-go/internal/crypto"
-	"github.com/icatme/wechatbot-go/internal/protocol"
+	"github.com/Icatme/wechatbot-go/internal/auth"
+	"github.com/Icatme/wechatbot-go/internal/crypto"
+	"github.com/Icatme/wechatbot-go/internal/protocol"
 )
 
 // MessageHandler is called for each incoming user message.
