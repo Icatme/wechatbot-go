@@ -1,12 +1,12 @@
 # wechatbot-go
 
-微信 iLink Bot SDK for Go —— 仅维护 Go 版本。
+一个专注 Go 语言的微信 iLink Bot SDK，从多语言仓库中独立出来单独维护。
 
-> 本项目 fork 自 [corespeed-io/wechatbot](https://github.com/corespeed-io/wechatbot)，
-> 仅保留并维护其中的 **Go SDK** 版本。原仓库还包含 Node.js、Python、Rust 等实现，
-> 如果你需要其他语言版本，请访问原仓库。
->
-> 核心协议与原始代码保持一致，后续会针对 Go SDK 持续做特性补全和稳定性改进。
+本项目基于 [corespeed-io/wechatbot](https://github.com/corespeed-io/wechatbot) 的 Go SDK 部分，但已拆分
+为独立的 Go-only 仓库并持续演进。原仓库同时维护 Node.js、Python、Rust 等版本，而这里只保留和
+改进 Go 实现：更完整的协议对齐、状态持久化、登录流程增强以及可扩展的消息处理钩子。
+
+如果你需要一个纯 Go、长期维护、面向实际运行场景的微信 Bot SDK，本仓库会更合适。
 
 ---
 
@@ -73,8 +73,9 @@ func main() {
 
 ## 与原仓库的关系
 
-- 原仓库：`github.com/corespeed-io/wechatbot`（多语言）
-- 本仓库：`github.com/Icatme/wechatbot-go`（仅 Go）
+- 原仓库：`github.com/corespeed-io/wechatbot`（多语言 SDK 集合）
+- 本仓库：`github.com/Icatme/wechatbot-go`（独立维护的 Go-only 分支）
+- 协议与核心实现源自原仓库的 Go 部分，但已不再同步合并
 - 许可证：MIT（保留原项目版权声明）
 
 ## 贡献
