@@ -23,6 +23,7 @@ import (
 	"github.com/Icatme/wechatbot-go/internal/crypto"
 	"github.com/Icatme/wechatbot-go/internal/markdown"
 	"github.com/Icatme/wechatbot-go/internal/protocol"
+	"github.com/Icatme/wechatbot-go/internal/remote"
 	"github.com/Icatme/wechatbot-go/internal/session"
 	"github.com/Icatme/wechatbot-go/internal/store"
 )
@@ -39,6 +40,7 @@ type Options struct {
 	BotAgent         string // UA-style, e.g. "MyBot/1.2.0"
 	RouteTag         string // sent as SKRouteTag header
 	StripMarkdown    bool   // strip markdown from outbound text
+	NotifyErrors     bool   // automatically notify user on send failure
 	LogLevel         string // "debug", "info", "warn", "error", "silent"
 	OnQRURL          func(url string)
 	OnScanned        func()
@@ -180,8 +182,11 @@ func (b *Bot) StopTyping(ctx context.Context, userID string) error {
 // SendContent describes what to send. Use one of:
 //   - SendText("Hello!")
 //   - SendImage(data)
+//   - SendImageURL("https://example.com/a.png")
 //   - SendVideo(data)
+//   - SendVideoURL("https://example.com/a.mp4")
 //   - SendFile(data, "report.pdf")
+//   - SendFileURL("https://example.com/report.pdf", "report.pdf")
 type SendContent struct {
 	Text     string
 	Image    []byte
@@ -189,6 +194,42 @@ type SendContent struct {
 	File     []byte
 	FileName string
 	Caption  string
+	ImageURL string
+	VideoURL string
+	FileURL  string
+}
+
+// resolveRemote downloads remote media when ImageURL/VideoURL/FileURL is set,
+// returning a SendContent backed by local bytes.
+func (content SendContent) resolveRemote(ctx context.Context) (SendContent, error) {
+	if content.ImageURL != "" {
+		data, _, err := remote.Download(ctx, content.ImageURL)
+		if err != nil {
+			return content, fmt.Errorf("download image: %w", err)
+		}
+		content.Image = data
+		content.ImageURL = ""
+	}
+	if content.VideoURL != "" {
+		data, _, err := remote.Download(ctx, content.VideoURL)
+		if err != nil {
+			return content, fmt.Errorf("download video: %w", err)
+		}
+		content.Video = data
+		content.VideoURL = ""
+	}
+	if content.FileURL != "" {
+		data, name, err := remote.Download(ctx, content.FileURL)
+		if err != nil {
+			return content, fmt.Errorf("download file: %w", err)
+		}
+		content.File = data
+		content.FileURL = ""
+		if content.FileName == "" {
+			content.FileName = name
+		}
+	}
+	return content, nil
 }
 
 // SendText creates a text SendContent.
@@ -197,12 +238,23 @@ func SendText(text string) SendContent { return SendContent{Text: text} }
 // SendImage creates an image SendContent.
 func SendImage(data []byte) SendContent { return SendContent{Image: data} }
 
+// SendImageURL creates an image SendContent from a remote URL.
+func SendImageURL(url string) SendContent { return SendContent{ImageURL: url} }
+
 // SendVideo creates a video SendContent.
 func SendVideo(data []byte) SendContent { return SendContent{Video: data} }
+
+// SendVideoURL creates a video SendContent from a remote URL.
+func SendVideoURL(url string) SendContent { return SendContent{VideoURL: url} }
 
 // SendFile creates a file SendContent.
 func SendFile(data []byte, fileName string) SendContent {
 	return SendContent{File: data, FileName: fileName}
+}
+
+// SendFileURL creates a file SendContent from a remote URL.
+func SendFileURL(url, fileName string) SendContent {
+	return SendContent{FileURL: url, FileName: fileName}
 }
 
 // ReplyContent replies with any content type.
@@ -210,7 +262,15 @@ func (b *Bot) ReplyContent(ctx context.Context, msg *IncomingMessage, content Se
 	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
 		b.log("warn", "failed to persist context token: %v", err)
 	}
-	return b.sendContent(ctx, msg.UserID, msg.ContextToken, content)
+	resolved, err := content.resolveRemote(ctx)
+	if err != nil {
+		return err
+	}
+	if err := b.sendContent(ctx, msg.UserID, msg.ContextToken, resolved); err != nil {
+		b.notifyError(ctx, msg.UserID, msg.ContextToken, err)
+		return err
+	}
+	return nil
 }
 
 // SendMedia sends any content type to a user.
@@ -219,7 +279,15 @@ func (b *Bot) SendMedia(ctx context.Context, userID string, content SendContent)
 	if ct == "" {
 		return fmt.Errorf("no context_token for user %s", userID)
 	}
-	return b.sendContent(ctx, userID, ct, content)
+	resolved, err := content.resolveRemote(ctx)
+	if err != nil {
+		return err
+	}
+	if err := b.sendContent(ctx, userID, ct, resolved); err != nil {
+		b.notifyError(ctx, userID, ct, err)
+		return err
+	}
+	return nil
 }
 
 // Download downloads media from an incoming message.
@@ -630,6 +698,22 @@ func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) e
 		}
 	}
 	return nil
+}
+
+// notifyError sends a short error notice to the user when NotifyErrors is enabled.
+// Errors are best-effort; failures to send the notice are logged but not returned.
+func (b *Bot) notifyError(ctx context.Context, userID, contextToken string, err error) {
+	if !b.opts.NotifyErrors {
+		return
+	}
+	creds := b.getCreds()
+	if creds == nil {
+		return
+	}
+	msg := "⚠️ 消息发送失败，请稍后重试。"
+	if e := b.client.SendMessage(ctx, creds.BaseURL, creds.Token, protocol.BuildTextMessage(userID, contextToken, msg)); e != nil {
+		b.log("warn", "failed to send error notice: %v", e)
+	}
 }
 
 func (b *Bot) rememberContext(wire *WireMessage) {

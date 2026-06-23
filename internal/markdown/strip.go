@@ -24,13 +24,13 @@ var (
 	// Horizontal rules.
 	hrRe = regexp.MustCompile("(?m)^[-*_]{3,}\\s*$")
 	// Bold/italic.
-	bold3Re    = regexp.MustCompile("\\*\\*\\*(.+?)\\*\\*\\*")
-	boldRe     = regexp.MustCompile("\\*\\*(.+?)\\*\\*")
-	italicRe   = regexp.MustCompile("\\*(.+?)\\*")
-	ubold3Re   = regexp.MustCompile("___(.+?)___")
-	uboldRe    = regexp.MustCompile("__(.+?)__")
-	uitalicRe  = regexp.MustCompile("_(.+?)_")
-	strikeRe   = regexp.MustCompile("~~(.+?)~~")
+	bold3Re   = regexp.MustCompile("\\*\\*\\*(.+?)\\*\\*\\*")
+	boldRe    = regexp.MustCompile("\\*\\*(.+?)\\*\\*")
+	italicRe  = regexp.MustCompile("\\*(.+?)\\*")
+	ubold3Re  = regexp.MustCompile("___(.+?)___")
+	uboldRe   = regexp.MustCompile("__(.+?)__")
+	uitalicRe = regexp.MustCompile("_(.+?)_")
+	strikeRe  = regexp.MustCompile("~~(.+?)~~")
 	// Blockquotes.
 	quoteRe = regexp.MustCompile("(?m)^>\\s?")
 	// Unordered lists: replace bullet markers with •.

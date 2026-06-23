@@ -52,4 +52,3 @@ func TestStripMarkdownTable(t *testing.T) {
 		t.Errorf("StripMarkdown table = %q, want %q", got, want)
 	}
 }
-
