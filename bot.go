@@ -35,6 +35,8 @@ type Options struct {
 	CredPath         string
 	ContextTokenPath string
 	CursorPath       string
+	BotAgent         string // UA-style, e.g. "MyBot/1.2.0"
+	RouteTag         string // sent as SKRouteTag header
 	LogLevel         string // "debug", "info", "warn", "error", "silent"
 	OnQRURL          func(url string)
 	OnScanned        func()
@@ -66,9 +68,12 @@ func New(opts ...Options) *Bot {
 	if o.BaseURL == "" {
 		o.BaseURL = protocol.DefaultBaseURL
 	}
+	client := protocol.NewClient()
+	client.BotAgent = protocol.SanitizeBotAgent(o.BotAgent)
+	client.RouteTag = o.RouteTag
 	return &Bot{
 		opts:          o,
-		client:        protocol.NewClient(),
+		client:        client,
 		sessionGuard:  session.NewGuard(),
 		contextTokens: store.NewContextStore(o.ContextTokenPath),
 		cursorStore:   store.NewCursorStore(o.CursorPath),
@@ -288,7 +293,18 @@ func (b *Bot) Run(ctx context.Context) error {
 	if loadErr := b.cursorStore.Load(); loadErr != nil {
 		b.log("warn", "Failed to load cursor: %v", loadErr)
 	}
+
+	if err := b.client.NotifyStart(pollCtx, creds.BaseURL, creds.Token); err != nil {
+		b.log("warn", "NotifyStart failed: %v", err)
+	}
+	defer func() {
+		if stopErr := b.client.NotifyStop(context.Background(), creds.BaseURL, creds.Token); stopErr != nil {
+			b.log("warn", "NotifyStop failed: %v", stopErr)
+		}
+	}()
+
 	retryDelay := time.Second
+	pollTimeout := 45 * time.Second
 
 	for {
 		select {
@@ -310,7 +326,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 
 		creds = b.getCreds()
-		updates, err := b.client.GetUpdates(pollCtx, creds.BaseURL, creds.Token, b.cursorStore.Get())
+		updates, err := b.client.GetUpdates(pollCtx, creds.BaseURL, creds.Token, b.cursorStore.Get(), pollTimeout)
 		if err != nil {
 			if pollCtx.Err() != nil {
 				b.log("info", "Long-poll loop stopped")
@@ -335,6 +351,9 @@ func (b *Bot) Run(ctx context.Context) error {
 			if saveErr := b.cursorStore.Set(updates.GetUpdatesBuf); saveErr != nil {
 				b.log("warn", "Failed to save cursor: %v", saveErr)
 			}
+		}
+		if updates.LongPollingTimeoutMs > 0 {
+			pollTimeout = time.Duration(updates.LongPollingTimeoutMs) * time.Millisecond
 		}
 		retryDelay = time.Second
 

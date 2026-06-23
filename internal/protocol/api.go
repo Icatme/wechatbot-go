@@ -18,14 +18,17 @@ import (
 )
 
 const (
-	DefaultBaseURL    = "https://ilinkai.weixin.qq.com"
-	CDNBaseURL        = "https://novac2c.cdn.weixin.qq.com/c2c"
-	ChannelVersion    = "0.1.0"
+	DefaultBaseURL = "https://ilinkai.weixin.qq.com"
+	CDNBaseURL     = "https://novac2c.cdn.weixin.qq.com/c2c"
+	ChannelVersion = "0.1.0"
 	// iLink-App-Id header value.
-	iLinkAppID        = "bot"
-	// iLink-App-ClientVersion header value (0x00MMNNPP for 0.1.0 = 256).
-	iLinkClientVer    = "256"
+	iLinkAppID = "bot"
 )
+
+// clientVersion returns the iLink-App-ClientVersion header value as a decimal string.
+func clientVersion() string {
+	return strconv.FormatUint(uint64(buildClientVersion(moduleVersion())), 10)
+}
 
 // APIError is returned when the iLink API returns a non-zero ret or HTTP error.
 type APIError struct {
@@ -52,16 +55,19 @@ func RandomWechatUIN() string {
 }
 
 // CommonHeaders returns headers included in both GET and POST requests.
-func CommonHeaders() http.Header {
+func (c *Client) CommonHeaders() http.Header {
 	h := http.Header{}
 	h.Set("iLink-App-Id", iLinkAppID)
-	h.Set("iLink-App-ClientVersion", iLinkClientVer)
+	h.Set("iLink-App-ClientVersion", clientVersion())
+	if c.RouteTag != "" {
+		h.Set("SKRouteTag", c.RouteTag)
+	}
 	return h
 }
 
 // AuthHeaders returns the standard iLink POST headers.
-func AuthHeaders(token string) http.Header {
-	h := CommonHeaders()
+func (c *Client) AuthHeaders(token string) http.Header {
+	h := c.CommonHeaders()
 	h.Set("Content-Type", "application/json")
 	h.Set("AuthorizationType", "ilink_bot_token")
 	h.Set("Authorization", "Bearer "+token)
@@ -69,20 +75,27 @@ func AuthHeaders(token string) http.Header {
 	return h
 }
 
-func baseInfo() map[string]string {
-	return map[string]string{"channel_version": ChannelVersion}
-}
-
 // Client wraps HTTP calls to the iLink API.
 type Client struct {
-	HTTP *http.Client
+	HTTP     *http.Client
+	BotAgent string
+	RouteTag string
 }
 
 // NewClient creates a protocol client with sensible defaults.
 func NewClient() *Client {
 	return &Client{
-		HTTP: &http.Client{Timeout: 45 * time.Second},
+		HTTP:     &http.Client{Timeout: 45 * time.Second},
+		BotAgent: defaultBotAgent,
 	}
+}
+
+func (c *Client) baseInfo() map[string]string {
+	info := map[string]string{"channel_version": ChannelVersion}
+	if c.BotAgent != "" {
+		info["bot_agent"] = c.BotAgent
+	}
+	return info
 }
 
 // QRCodeResponse from get_bot_qrcode.
@@ -103,11 +116,12 @@ type QRStatusResponse struct {
 
 // GetUpdatesResponse from getupdates.
 type GetUpdatesResponse struct {
-	Ret           int               `json:"ret"`
-	Msgs          []json.RawMessage `json:"msgs"`
-	GetUpdatesBuf string            `json:"get_updates_buf"`
-	ErrCode       int               `json:"errcode,omitempty"`
-	ErrMsg        string            `json:"errmsg,omitempty"`
+	Ret                 int               `json:"ret"`
+	Msgs                []json.RawMessage `json:"msgs"`
+	GetUpdatesBuf       string            `json:"get_updates_buf"`
+	ErrCode             int               `json:"errcode,omitempty"`
+	ErrMsg              string            `json:"errmsg,omitempty"`
+	LongPollingTimeoutMs int              `json:"longpolling_timeout_ms,omitempty"`
 }
 
 // GetConfigResponse from getconfig.
@@ -120,7 +134,7 @@ type GetConfigResponse struct {
 func (c *Client) GetQRCode(ctx context.Context, baseURL string) (*QRCodeResponse, error) {
 	u := baseURL + "/ilink/bot/get_bot_qrcode?bot_type=3"
 	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
-	for k, v := range CommonHeaders() {
+	for k, v := range c.CommonHeaders() {
 		req.Header[k] = v
 	}
 	resp, err := c.HTTP.Do(req)
@@ -139,7 +153,7 @@ func (c *Client) GetQRCode(ctx context.Context, baseURL string) (*QRCodeResponse
 func (c *Client) PollQRStatus(ctx context.Context, baseURL, qrcode string) (*QRStatusResponse, error) {
 	u := baseURL + "/ilink/bot/get_qrcode_status?qrcode=" + url.QueryEscape(qrcode)
 	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
-	for k, v := range CommonHeaders() {
+	for k, v := range c.CommonHeaders() {
 		req.Header[k] = v
 	}
 	resp, err := c.HTTP.Do(req)
@@ -160,7 +174,7 @@ func (c *Client) apiPost(ctx context.Context, baseURL, endpoint, token string, b
 	defer cancel()
 
 	req, _ := http.NewRequestWithContext(httpCtx, "POST", u, bytes.NewReader(data))
-	for k, v := range AuthHeaders(token) {
+	for k, v := range c.AuthHeaders(token) {
 		req.Header[k] = v
 	}
 
@@ -198,12 +212,13 @@ func (c *Client) apiPost(ctx context.Context, baseURL, endpoint, token string, b
 }
 
 // GetUpdates performs a long-poll for new messages.
-func (c *Client) GetUpdates(ctx context.Context, baseURL, token, cursor string) (*GetUpdatesResponse, error) {
+// timeout controls the client-side HTTP timeout for this request.
+func (c *Client) GetUpdates(ctx context.Context, baseURL, token, cursor string, timeout time.Duration) (*GetUpdatesResponse, error) {
 	body := map[string]interface{}{
 		"get_updates_buf": cursor,
-		"base_info":       baseInfo(),
+		"base_info":       c.baseInfo(),
 	}
-	raw, err := c.apiPost(ctx, baseURL, "/ilink/bot/getupdates", token, body, 45*time.Second)
+	raw, err := c.apiPost(ctx, baseURL, "/ilink/bot/getupdates", token, body, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +231,7 @@ func (c *Client) GetUpdates(ctx context.Context, baseURL, token, cursor string) 
 func (c *Client) SendMessage(ctx context.Context, baseURL, token string, msg interface{}) error {
 	body := map[string]interface{}{
 		"msg":       msg,
-		"base_info": baseInfo(),
+		"base_info": c.baseInfo(),
 	}
 	_, err := c.apiPost(ctx, baseURL, "/ilink/bot/sendmessage", token, body, 15*time.Second)
 	return err
@@ -227,7 +242,7 @@ func (c *Client) GetConfig(ctx context.Context, baseURL, token, userID, contextT
 	body := map[string]interface{}{
 		"ilink_user_id": userID,
 		"context_token": contextToken,
-		"base_info":     baseInfo(),
+		"base_info":     c.baseInfo(),
 	}
 	raw, err := c.apiPost(ctx, baseURL, "/ilink/bot/getconfig", token, body, 15*time.Second)
 	if err != nil {
@@ -244,9 +259,27 @@ func (c *Client) SendTyping(ctx context.Context, baseURL, token, userID, ticket 
 		"ilink_user_id":  userID,
 		"typing_ticket":  ticket,
 		"status":         status,
-		"base_info":      baseInfo(),
+		"base_info":      c.baseInfo(),
 	}
 	_, err := c.apiPost(ctx, baseURL, "/ilink/bot/sendtyping", token, body, 15*time.Second)
+	return err
+}
+
+// NotifyStart tells WeChat that this bot client is starting.
+func (c *Client) NotifyStart(ctx context.Context, baseURL, token string) error {
+	body := map[string]interface{}{
+		"base_info": c.baseInfo(),
+	}
+	_, err := c.apiPost(ctx, baseURL, "/ilink/bot/msg/notifystart", token, body, 10*time.Second)
+	return err
+}
+
+// NotifyStop tells WeChat that this bot client is stopping.
+func (c *Client) NotifyStop(ctx context.Context, baseURL, token string) error {
+	body := map[string]interface{}{
+		"base_info": c.baseInfo(),
+	}
+	_, err := c.apiPost(ctx, baseURL, "/ilink/bot/msg/notifystop", token, body, 10*time.Second)
 	return err
 }
 
@@ -284,7 +317,7 @@ func (c *Client) GetUploadURL(ctx context.Context, baseURL, token string, req Ge
 		"filesize":       req.FileSize,
 		"no_need_thumb":  req.NoNeedThumb,
 		"aeskey":         req.AESKey,
-		"base_info":      baseInfo(),
+		"base_info":      c.baseInfo(),
 	}
 	raw, err := c.apiPost(ctx, baseURL, "/ilink/bot/getuploadurl", token, body, 15*time.Second)
 	if err != nil {
