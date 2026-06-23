@@ -612,8 +612,7 @@ func (b *Bot) cdnDownload(ctx context.Context, media *CDNMedia, aeskeyOverride s
 	if err != nil {
 		return nil, fmt.Errorf("cdn download request: %w", err)
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cdn download: %w", err)
 	}
@@ -623,9 +622,13 @@ func (b *Bot) cdnDownload(ctx context.Context, media *CDNMedia, aeskeyOverride s
 		return nil, fmt.Errorf("cdn download failed: HTTP %d", resp.StatusCode)
 	}
 
-	ciphertext, err := io.ReadAll(resp.Body)
+	reader := io.LimitReader(resp.Body, maxDownloadBytes+1)
+	ciphertext, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("cdn download read: %w", err)
+	}
+	if len(ciphertext) > maxDownloadBytes {
+		return nil, fmt.Errorf("cdn download exceeds %d bytes", maxDownloadBytes)
 	}
 
 	keySource := aeskeyOverride
@@ -690,8 +693,7 @@ func (b *Bot) cdnUpload(ctx context.Context, creds *auth.Credentials, data []byt
 		return nil, fmt.Errorf("cdn upload request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cdn upload: %w", err)
 	}
@@ -728,6 +730,8 @@ func cdnMediaMap(m *CDNMedia) map[string]interface{} {
 		"encrypt_type":        m.EncryptType,
 	}
 }
+
+const maxDownloadBytes = 100 * 1024 * 1024
 
 var imageExts = map[string]bool{".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true, ".bmp": true, ".svg": true}
 var videoExts = map[string]bool{".mp4": true, ".mov": true, ".webm": true, ".mkv": true, ".avi": true}
@@ -829,8 +833,11 @@ func (b *Bot) parseMessage(wire *WireMessage) *IncomingMessage {
 		}
 		if item.RefMsg != nil {
 			q := &QuotedMessage{Title: item.RefMsg.Title}
-			if item.RefMsg.MessageItem != nil && item.RefMsg.MessageItem.TextItem != nil {
-				q.Text = item.RefMsg.MessageItem.TextItem.Text
+			if item.RefMsg.MessageItem != nil {
+				q.Type = detectType([]MessageItem{*item.RefMsg.MessageItem})
+				if item.RefMsg.MessageItem.TextItem != nil {
+					q.Text = item.RefMsg.MessageItem.TextItem.Text
+				}
 			}
 			msg.QuotedMessage = q
 		}
@@ -859,13 +866,24 @@ func (b *Bot) reportError(err error) {
 	if b.opts.OnError != nil {
 		b.opts.OnError(err)
 	}
+	if hookErr := b.hooks.OnError.Run(err); hookErr != nil {
+		b.log("warn", "OnError hook failed: %v", hookErr)
+	}
 }
 
 func (b *Bot) log(level, format string, args ...interface{}) {
 	if b.opts.LogLevel == "silent" {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "[wechatbot] %s\n", fmt.Sprintf(format, args...))
+	b.mu.Lock()
+	logger := b.logger
+	b.mu.Unlock()
+	msg := fmt.Sprintf(format, args...)
+	if logger != nil {
+		logger(level, msg)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[wechatbot] %s\n", msg)
 }
 
 // SetLogger replaces the default stderr logger with a custom implementation.
@@ -876,17 +894,6 @@ func (b *Bot) SetLogger(fn func(level, msg string)) {
 	b.mu.Lock()
 	b.logger = fn
 	b.mu.Unlock()
-}
-
-func (b *Bot) doLog(level, format string, args ...interface{}) {
-	b.mu.Lock()
-	logger := b.logger
-	b.mu.Unlock()
-	if logger != nil {
-		logger(level, fmt.Sprintf(format, args...))
-		return
-	}
-	b.log(level, format, args...)
 }
 
 func detectType(items []MessageItem) ContentType {
