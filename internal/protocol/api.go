@@ -100,7 +100,7 @@ type QRCodeResponse struct {
 
 // QRStatusResponse from get_qrcode_status.
 type QRStatusResponse struct {
-	Status       string `json:"status"` // wait, scaned, confirmed, expired, scaned_but_redirect
+	Status       string `json:"status"` // wait, scaned, confirmed, expired, scaned_but_redirect, need_verifycode, verify_code_blocked, binded_redirect
 	BotToken     string `json:"bot_token,omitempty"`
 	BotID        string `json:"ilink_bot_id,omitempty"`
 	UserID       string `json:"ilink_user_id,omitempty"`
@@ -125,11 +125,27 @@ type GetConfigResponse struct {
 }
 
 // GetQRCode requests a new QR code for login.
-func (c *Client) GetQRCode(ctx context.Context, baseURL string) (*QRCodeResponse, error) {
+// localTokenList may contain up to 10 recent bot tokens to speed up re-login.
+func (c *Client) GetQRCode(ctx context.Context, baseURL string, localTokenList []string) (*QRCodeResponse, error) {
 	u := baseURL + "/ilink/bot/get_bot_qrcode?bot_type=3"
-	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
+	body := map[string]interface{}{}
+	if len(localTokenList) > 0 {
+		if len(localTokenList) > 10 {
+			localTokenList = localTokenList[:10]
+		}
+		body["local_token_list"] = localTokenList
+	}
+	var bodyReader io.Reader
+	if len(body) > 0 {
+		data, _ := json.Marshal(body)
+		bodyReader = bytes.NewReader(data)
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, u, bodyReader)
 	for k, v := range c.CommonHeaders() {
 		req.Header[k] = v
+	}
+	if bodyReader != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -144,8 +160,12 @@ func (c *Client) GetQRCode(ctx context.Context, baseURL string) (*QRCodeResponse
 }
 
 // PollQRStatus polls the QR code scan status.
-func (c *Client) PollQRStatus(ctx context.Context, baseURL, qrcode string) (*QRStatusResponse, error) {
+// If verifyCode is non-empty, it is sent on the next poll after a need_verifycode response.
+func (c *Client) PollQRStatus(ctx context.Context, baseURL, qrcode, verifyCode string) (*QRStatusResponse, error) {
 	u := baseURL + "/ilink/bot/get_qrcode_status?qrcode=" + url.QueryEscape(qrcode)
+	if verifyCode != "" {
+		u += "&verify_code=" + url.QueryEscape(verifyCode)
+	}
 	req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
 	for k, v := range c.CommonHeaders() {
 		req.Header[k] = v

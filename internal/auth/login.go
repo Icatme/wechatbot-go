@@ -69,12 +69,13 @@ func ClearCredentials(path string) error {
 
 // LoginOptions configures the login flow.
 type LoginOptions struct {
-	BaseURL   string
-	CredPath  string
-	Force     bool
-	OnQRURL   func(url string)
-	OnScanned func()
-	OnExpired func()
+	BaseURL      string
+	CredPath     string
+	Force        bool
+	OnQRURL      func(url string)
+	OnScanned    func()
+	OnExpired    func()
+	OnVerifyCode func() (string, error)
 }
 
 const (
@@ -84,18 +85,17 @@ const (
 
 // Login performs QR code login, returning credentials.
 // If stored credentials exist and Force is false, returns them directly.
-// Handles IDC redirect (scaned_but_redirect) and limits QR refreshes.
+// Handles IDC redirect (scaned_but_redirect), verify codes, already-bound
+// accounts, and limits QR refreshes.
 func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Credentials, error) {
 	baseURL := opts.BaseURL
 	if baseURL == "" {
 		baseURL = protocol.DefaultBaseURL
 	}
 
-	if !opts.Force {
-		creds, err := LoadCredentials(opts.CredPath)
-		if err == nil && creds != nil {
-			return creds, nil
-		}
+	existing, _ := LoadCredentials(opts.CredPath)
+	if !opts.Force && existing != nil {
+		return existing, nil
 	}
 
 	qrRefreshCount := 0
@@ -105,7 +105,8 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 			return nil, fmt.Errorf("QR code expired %d times — login aborted", maxQRRefreshCount)
 		}
 
-		qr, err := client.GetQRCode(ctx, fixedQRBaseURL)
+		localTokens := localTokenList(existing)
+		qr, err := client.GetQRCode(ctx, fixedQRBaseURL, localTokens)
 		if err != nil {
 			return nil, fmt.Errorf("get QR code: %w", err)
 		}
@@ -118,11 +119,13 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 
 		lastStatus := ""
 		currentPollBaseURL := fixedQRBaseURL
+		pendingVerifyCode := ""
 		for {
-			status, err := client.PollQRStatus(ctx, currentPollBaseURL, qr.QRCode)
+			status, err := client.PollQRStatus(ctx, currentPollBaseURL, qr.QRCode, pendingVerifyCode)
 			if err != nil {
 				return nil, fmt.Errorf("poll QR status: %w", err)
 			}
+			pendingVerifyCode = "" // clear after use
 
 			if status.Status != lastStatus {
 				lastStatus = status.Status
@@ -141,6 +144,8 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 					}
 				case "confirmed":
 					fmt.Fprintln(os.Stderr, "[wechatbot] Login confirmed")
+				case "binded_redirect":
+					fmt.Fprintln(os.Stderr, "[wechatbot] Already bound — using existing credentials")
 				}
 			}
 
@@ -148,21 +153,39 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 				if status.BotToken == "" || status.BotID == "" || status.UserID == "" {
 					return nil, fmt.Errorf("login confirmed but missing credentials")
 				}
-				resolvedBase := baseURL
-				if status.BaseURL != "" {
-					resolvedBase = status.BaseURL
+				return finalizeLogin(status, baseURL, opts.CredPath)
+			}
+
+			if status.Status == "binded_redirect" {
+				if existing != nil {
+					return existing, nil
 				}
-				creds := &Credentials{
-					Token:     status.BotToken,
-					BaseURL:   resolvedBase,
-					AccountID: status.BotID,
-					UserID:    status.UserID,
-					SavedAt:   time.Now().UTC().Format(time.RFC3339),
+				// Try loading from disk one more time.
+				creds, err := LoadCredentials(opts.CredPath)
+				if err == nil && creds != nil {
+					return creds, nil
 				}
-				if err := SaveCredentials(creds, opts.CredPath); err != nil {
-					fmt.Fprintf(os.Stderr, "[wechatbot] Warning: could not save credentials: %v\n", err)
+				return nil, fmt.Errorf("account already bound but no local credentials found")
+			}
+
+			if status.Status == "need_verifycode" {
+				if opts.OnVerifyCode == nil {
+					return nil, fmt.Errorf("verify code required but no OnVerifyCode handler configured")
 				}
-				return creds, nil
+				code, err := opts.OnVerifyCode()
+				if err != nil {
+					return nil, fmt.Errorf("verify code input failed: %w", err)
+				}
+				if code == "" {
+					return nil, fmt.Errorf("verify code cannot be empty")
+				}
+				pendingVerifyCode = code
+				continue
+			}
+
+			if status.Status == "verify_code_blocked" {
+				fmt.Fprintln(os.Stderr, "[wechatbot] Verify code blocked — requesting new QR")
+				break // Outer loop gets a new QR
 			}
 
 			// Handle IDC redirect
@@ -182,4 +205,29 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 			time.Sleep(2 * time.Second)
 		}
 	}
+}
+
+func localTokenList(existing *Credentials) []string {
+	if existing != nil && existing.Token != "" {
+		return []string{existing.Token}
+	}
+	return nil
+}
+
+func finalizeLogin(status *protocol.QRStatusResponse, baseURL, credPath string) (*Credentials, error) {
+	resolvedBase := baseURL
+	if status.BaseURL != "" {
+		resolvedBase = status.BaseURL
+	}
+	creds := &Credentials{
+		Token:     status.BotToken,
+		BaseURL:   resolvedBase,
+		AccountID: status.BotID,
+		UserID:    status.UserID,
+		SavedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if err := SaveCredentials(creds, credPath); err != nil {
+		fmt.Fprintf(os.Stderr, "[wechatbot] Warning: could not save credentials: %v\n", err)
+	}
+	return creds, nil
 }

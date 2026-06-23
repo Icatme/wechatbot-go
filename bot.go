@@ -34,6 +34,7 @@ type MessageHandler func(msg *IncomingMessage)
 // Options configures a Bot instance.
 type Options struct {
 	BaseURL          string
+	AccountID        string // optional account identifier for multi-bot isolation
 	CredPath         string
 	ContextTokenPath string
 	CursorPath       string
@@ -45,6 +46,7 @@ type Options struct {
 	OnQRURL          func(url string)
 	OnScanned        func()
 	OnExpired        func()
+	OnVerifyCode     func() (string, error)
 	OnError          func(err error)
 }
 
@@ -72,6 +74,15 @@ func New(opts ...Options) *Bot {
 	if o.BaseURL == "" {
 		o.BaseURL = protocol.DefaultBaseURL
 	}
+	if o.CredPath == "" && o.AccountID != "" {
+		o.CredPath = filepath.Join(store.AccountStateDir(o.AccountID), "credentials.json")
+	}
+	if o.ContextTokenPath == "" && o.AccountID != "" {
+		o.ContextTokenPath = filepath.Join(store.AccountStateDir(o.AccountID), "context_tokens.json")
+	}
+	if o.CursorPath == "" && o.AccountID != "" {
+		o.CursorPath = filepath.Join(store.AccountStateDir(o.AccountID), "cursor.json")
+	}
 	client := protocol.NewClient()
 	client.BotAgent = protocol.SanitizeBotAgent(o.BotAgent)
 	client.RouteTag = o.RouteTag
@@ -79,8 +90,8 @@ func New(opts ...Options) *Bot {
 		opts:          o,
 		client:        client,
 		sessionGuard:  session.NewGuard(),
-		contextTokens: store.NewContextStore(o.ContextTokenPath),
-		cursorStore:   store.NewCursorStore(o.CursorPath),
+		contextTokens: store.NewContextStore(o.AccountID, o.ContextTokenPath),
+		cursorStore:   store.NewCursorStore(o.AccountID, o.CursorPath),
 	}
 }
 
@@ -90,9 +101,10 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 		BaseURL:   b.opts.BaseURL,
 		CredPath:  b.opts.CredPath,
 		Force:     force,
-		OnQRURL:   b.opts.OnQRURL,
-		OnScanned: b.opts.OnScanned,
-		OnExpired: b.opts.OnExpired,
+		OnQRURL:      b.opts.OnQRURL,
+		OnScanned:    b.opts.OnScanned,
+		OnExpired:    b.opts.OnExpired,
+		OnVerifyCode: b.opts.OnVerifyCode,
 	})
 	if err != nil {
 		return nil, err

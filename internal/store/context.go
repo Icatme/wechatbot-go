@@ -17,10 +17,11 @@ type ContextStore struct {
 }
 
 // NewContextStore creates a store backed by the given file path.
-// If path is empty, it defaults to ~/.wechatbot/context_tokens.json.
-func NewContextStore(path string) *ContextStore {
+// If path is empty, it defaults to ~/.wechatbot/accounts/{accountID}/context_tokens.json
+// when accountID is non-empty, otherwise ~/.wechatbot/context_tokens.json.
+func NewContextStore(accountID, path string) *ContextStore {
 	if path == "" {
-		path = filepath.Join(DefaultStateDir(), "context_tokens.json")
+		path = filepath.Join(AccountStateDir(accountID), "context_tokens.json")
 	}
 	return &ContextStore{
 		path: path,

@@ -21,10 +21,11 @@ type CursorData struct {
 }
 
 // NewCursorStore creates a store backed by the given file path.
-// If path is empty, it defaults to ~/.wechatbot/cursor.json.
-func NewCursorStore(path string) *CursorStore {
+// If path is empty, it defaults to ~/.wechatbot/accounts/{accountID}/cursor.json
+// when accountID is non-empty, otherwise ~/.wechatbot/cursor.json.
+func NewCursorStore(accountID, path string) *CursorStore {
 	if path == "" {
-		path = filepath.Join(DefaultStateDir(), "cursor.json")
+		path = filepath.Join(AccountStateDir(accountID), "cursor.json")
 	}
 	return &CursorStore{path: path}
 }

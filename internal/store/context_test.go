@@ -8,7 +8,7 @@ import (
 
 func TestContextStoreRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	s := NewContextStore(filepath.Join(dir, "context_tokens.json"))
+	s := NewContextStore("", filepath.Join(dir, "context_tokens.json"))
 
 	if err := s.Set("user1", "token-a"); err != nil {
 		t.Fatalf("set failed: %v", err)
@@ -21,7 +21,7 @@ func TestContextStoreRoundTrip(t *testing.T) {
 		t.Fatalf("expected token-a, got %s", s.Get("user1"))
 	}
 
-	s2 := NewContextStore(s.Path())
+	s2 := NewContextStore("", s.Path())
 	if err := s2.Load(); err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestContextStoreRoundTrip(t *testing.T) {
 
 func TestContextStoreDelete(t *testing.T) {
 	dir := t.TempDir()
-	s := NewContextStore(filepath.Join(dir, "context_tokens.json"))
+	s := NewContextStore("", filepath.Join(dir, "context_tokens.json"))
 	_ = s.Set("user1", "token-a")
 	_ = s.Delete("user1")
 	if s.Get("user1") != "" {
@@ -42,7 +42,7 @@ func TestContextStoreDelete(t *testing.T) {
 
 func TestContextStoreClear(t *testing.T) {
 	dir := t.TempDir()
-	s := NewContextStore(filepath.Join(dir, "context_tokens.json"))
+	s := NewContextStore("", filepath.Join(dir, "context_tokens.json"))
 	_ = s.Set("user1", "token-a")
 	_ = s.Clear()
 	if len(s.All()) != 0 {
@@ -56,7 +56,7 @@ func TestContextStoreClear(t *testing.T) {
 func TestContextStoreEmptyPath(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)
-	s := NewContextStore("")
+	s := NewContextStore("", "")
 	if s.Path() == "" {
 		t.Fatal("expected default path")
 	}
@@ -64,7 +64,7 @@ func TestContextStoreEmptyPath(t *testing.T) {
 
 func TestContextStoreMissingFile(t *testing.T) {
 	dir := t.TempDir()
-	s := NewContextStore(filepath.Join(dir, "not-exist.json"))
+	s := NewContextStore("", filepath.Join(dir, "not-exist.json"))
 	if err := s.Load(); err != nil {
 		t.Fatalf("missing file should not error: %v", err)
 	}
