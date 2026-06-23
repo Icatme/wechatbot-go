@@ -21,6 +21,7 @@ import (
 	"github.com/Icatme/wechatbot-go/internal/auth"
 	"github.com/Icatme/wechatbot-go/internal/config"
 	"github.com/Icatme/wechatbot-go/internal/crypto"
+	"github.com/Icatme/wechatbot-go/internal/markdown"
 	"github.com/Icatme/wechatbot-go/internal/protocol"
 	"github.com/Icatme/wechatbot-go/internal/session"
 	"github.com/Icatme/wechatbot-go/internal/store"
@@ -37,6 +38,7 @@ type Options struct {
 	CursorPath       string
 	BotAgent         string // UA-style, e.g. "MyBot/1.2.0"
 	RouteTag         string // sent as SKRouteTag header
+	StripMarkdown    bool   // strip markdown from outbound text
 	LogLevel         string // "debug", "info", "warn", "error", "silent"
 	OnQRURL          func(url string)
 	OnScanned        func()
@@ -393,7 +395,7 @@ func (b *Bot) Stop() {
 // --- internal ---
 
 func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, content SendContent) error {
-	// Text
+	// Text-only path.
 	if content.Text != "" {
 		return b.sendText(ctx, userID, content.Text, contextToken)
 	}
@@ -403,25 +405,25 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		return fmt.Errorf("not logged in; call Login() first")
 	}
 
+	// Send caption as a separate text message first, then send the media.
+	if content.Caption != "" {
+		if err := b.sendText(ctx, userID, content.Caption, contextToken); err != nil {
+			return err
+		}
+	}
+
 	// Image
 	if content.Image != nil {
 		result, err := b.cdnUpload(ctx, creds, content.Image, userID, int(MediaImage))
 		if err != nil {
 			return err
 		}
-		items := []map[string]interface{}{}
-		if content.Caption != "" {
-			items = append(items, map[string]interface{}{
-				"type": 1, "text_item": map[string]string{"text": content.Caption},
-			})
-		}
-		items = append(items, map[string]interface{}{
+		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
 			"type": 2, "image_item": map[string]interface{}{
 				"media":    cdnMediaMap(&result.Media),
 				"mid_size": result.EncryptedFileSize,
 			},
-		})
-		msg := protocol.BuildMediaMessage(userID, contextToken, items)
+		}})
 		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
 	}
 
@@ -431,19 +433,12 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		if err != nil {
 			return err
 		}
-		items := []map[string]interface{}{}
-		if content.Caption != "" {
-			items = append(items, map[string]interface{}{
-				"type": 1, "text_item": map[string]string{"text": content.Caption},
-			})
-		}
-		items = append(items, map[string]interface{}{
+		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
 			"type": 5, "video_item": map[string]interface{}{
 				"media":      cdnMediaMap(&result.Media),
 				"video_size": result.EncryptedFileSize,
 			},
-		})
-		msg := protocol.BuildMediaMessage(userID, contextToken, items)
+		}})
 		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
 	}
 
@@ -455,28 +450,29 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		}
 		cat := categorizeByExtension(fileName)
 		if cat == "image" {
-			return b.sendContent(ctx, userID, contextToken, SendContent{Image: content.File, Caption: content.Caption})
+			return b.sendContent(ctx, userID, contextToken, SendContent{Image: content.File})
 		}
 		if cat == "video" {
-			return b.sendContent(ctx, userID, contextToken, SendContent{Video: content.File, Caption: content.Caption})
+			return b.sendContent(ctx, userID, contextToken, SendContent{Video: content.File})
 		}
 		// Generic file
-		if content.Caption != "" {
-			_ = b.sendText(ctx, userID, content.Caption, contextToken)
-		}
 		result, err := b.cdnUpload(ctx, creds, content.File, userID, int(MediaFile))
 		if err != nil {
 			return err
 		}
-		items := []map[string]interface{}{
-			{"type": 4, "file_item": map[string]interface{}{
+		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
+			"type": 4, "file_item": map[string]interface{}{
 				"media":     cdnMediaMap(&result.Media),
 				"file_name": fileName,
 				"len":       strconv.Itoa(len(content.File)),
-			}},
-		}
-		msg := protocol.BuildMediaMessage(userID, contextToken, items)
+			},
+		}})
 		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
+	}
+
+	// Caption-only is valid: we already sent it above.
+	if content.Caption != "" {
+		return nil
 	}
 
 	return fmt.Errorf("empty SendContent")
@@ -623,6 +619,9 @@ func categorizeByExtension(filename string) string {
 
 func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) error {
 	creds := b.getCreds()
+	if b.opts.StripMarkdown {
+		text = markdown.StripMarkdown(text)
+	}
 	chunks := chunkText(text, 4000)
 	for _, chunk := range chunks {
 		msg := protocol.BuildTextMessage(userID, contextToken, chunk)
