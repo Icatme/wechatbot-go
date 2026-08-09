@@ -20,6 +20,8 @@
 
 - Aligned the public message envelope with official Agent fields: message/item timestamps, session/group/run correlation IDs, and tool-call start/result item types 11/12, with parsed correlation metadata and protocol tests.
 
+- Added a one-item outbound contract with caller-stable/generated `client_id`, failure-safe `SendResult`, per-message `run_id`, tool-call progress builders, and wire-level BeforeSend/AfterSend hooks across text and media sends.
+
 ## 2026-08-11
 
 - Closed reliable-delivery failure gaps: malformed wire messages now fail closed, replay identities are conversation-scoped and committed as one alias set, and credential/replay/cursor/context JSON state uses atomic replacement with disk-before-memory publication.

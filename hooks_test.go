@@ -106,18 +106,21 @@ func TestHookRegistryStopsOnError(t *testing.T) {
 	}
 }
 
-func TestBeforeSendHookMutatesContent(t *testing.T) {
+func TestBeforeSendHookMutatesMessage(t *testing.T) {
 	bot := New(Options{})
-	bot.Hooks().BeforeSend.Register(func(c *SendContent) error {
-		c.Text = "hooked"
+	bot.Hooks().BeforeSend.Register(func(req *SendRequest) error {
+		req.Message.Item.TextItem.Text = "hooked"
 		return nil
 	})
-	content := SendText("original")
-	if err := bot.hooks.BeforeSend.Run(&content); err != nil {
+	request := SendRequest{Message: OutboundMessage{Item: MessageItem{
+		Type:     ItemText,
+		TextItem: &TextItem{Text: "original"},
+	}}}
+	if err := bot.hooks.BeforeSend.Run(&request); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if content.Text != "hooked" {
-		t.Fatalf("expected hooked, got %s", content.Text)
+	if request.Message.Item.TextItem.Text != "hooked" {
+		t.Fatalf("expected hooked, got %s", request.Message.Item.TextItem.Text)
 	}
 }
 

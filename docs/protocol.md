@@ -53,7 +53,8 @@ Body: {
   msg: {
     from_user_id: "",
     to_user_id: "<user_id>",
-    client_id: "<uuid>",
+    client_id: "<stable_client_id>",
+    run_id: "<optional_agent_run_id>",
     message_type: 2,        // BOT
     message_state: 2,       // FINISH
     context_token: "<from_inbound_msg>",
@@ -62,6 +63,12 @@ Body: {
   base_info: {...}
 }
 ```
+
+`SendMessage` / `ReplyMessage` each send exactly one item and return the effective
+`client_id` and `run_id`. A caller-supplied `client_id` is preserved; when the SDK
+generates one, it is returned even if the HTTP attempt fails so an explicit retry
+can reuse the same identity. Text chunking and media captions use the convenience
+APIs and may produce multiple independent requests.
 
 ## Send Typing
 
