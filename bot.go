@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,23 +31,24 @@ import (
 
 // Options configures a Bot instance.
 type Options struct {
-	BaseURL          string
-	AccountID        string // optional account identifier for multi-bot isolation
-	CredPath         string
-	ContextTokenPath string
-	CursorPath       string
-	ReplayPath       string // optional persistent replay-dedupe state path
-	BotAgent         string // UA-style, e.g. "MyBot/1.2.0"
-	RouteTag         string // sent as SKRouteTag header
-	StripMarkdown    bool   // strip markdown from outbound text
-	NotifyErrors     bool   // automatically notify user on send failure
-	LogLevel         string // "debug", "info", "warn", "error", "silent"
-	Logger           *botlog.Logger
-	OnQRURL          func(url string)
-	OnScanned        func()
-	OnExpired        func()
-	OnVerifyCode     func() (string, error)
-	OnError          func(err error)
+	BaseURL               string
+	AccountID             string // optional account identifier for multi-bot isolation
+	CredPath              string
+	ContextTokenPath      string
+	CursorPath            string
+	ReplayPath            string // optional persistent replay-dedupe state path
+	BotAgent              string // UA-style, e.g. "MyBot/1.2.0"
+	RouteTag              string // sent as SKRouteTag header
+	StripMarkdown         bool   // strip markdown from outbound text
+	NotifyErrors          bool   // automatically notify user on send failure
+	LogLevel              string // "debug", "info", "warn", "error", "silent"
+	MaxConcurrentHandlers int    // maximum concurrent conversations; defaults to 4 and caps at 256
+	Logger                *botlog.Logger
+	OnQRURL               func(url string)
+	OnScanned             func()
+	OnExpired             func()
+	OnVerifyCode          func() (string, error)
+	OnError               func(err error)
 }
 
 // Bot is the main WeChat bot client.
@@ -492,7 +492,7 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	b.log("info", "Long-poll loop started")
 	if loadErr := b.cursorStore.Load(); loadErr != nil {
-		b.log("warn", "Failed to load cursor: %v", loadErr)
+		return fmt.Errorf("load cursor state: %w", loadErr)
 	}
 	if err := b.replayStore.Load(); err != nil {
 		return fmt.Errorf("load replay state: %w", err)
@@ -630,16 +630,19 @@ func (b *Bot) Run(ctx context.Context) error {
 }
 
 func (b *Bot) processUpdateBatches(ctx context.Context, handler MessageHandler, batches <-chan updateBatch) error {
+	dispatcher := newKeyedDispatcher(ctx, b, handler, b.opts.MaxConcurrentHandlers)
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
-		case batch := <-batches:
-			if err := b.processUpdateBatch(ctx, handler, batch); err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
-					return nil
-				}
-				return err
+			return dispatcher.wait()
+		case <-dispatcher.failure():
+			return dispatcher.wait()
+		case batch, ok := <-batches:
+			if !ok {
+				return dispatcher.drain()
+			}
+			if err := dispatcher.submit(batch); err != nil {
+				return dispatcher.wait()
 			}
 		}
 	}
@@ -650,7 +653,11 @@ func (b *Bot) processUpdateBatch(ctx context.Context, handler MessageHandler, ba
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := b.processRawMessage(ctx, handler, rawMsg); err != nil {
+		wire, err := b.decodeWireMessage(rawMsg)
+		if err != nil {
+			return err
+		}
+		if err := b.processWireMessage(ctx, handler, wire); err != nil {
 			return err
 		}
 	}
@@ -662,13 +669,16 @@ func (b *Bot) processUpdateBatch(ctx context.Context, handler MessageHandler, ba
 	return nil
 }
 
-func (b *Bot) processRawMessage(ctx context.Context, handler MessageHandler, rawMsg json.RawMessage) error {
+func (b *Bot) decodeWireMessage(rawMsg json.RawMessage) (*WireMessage, error) {
 	var wire WireMessage
 	if err := json.Unmarshal(rawMsg, &wire); err != nil {
-		return fmt.Errorf("decode incoming message: %w", err)
+		return nil, fmt.Errorf("decode incoming message: %w", err)
 	}
+	return &wire, nil
+}
 
-	keys := replayKeys(&wire)
+func (b *Bot) processWireMessage(ctx context.Context, handler MessageHandler, wire *WireMessage) error {
+	keys := replayKeys(wire)
 	// replayKeys orders aliases strongest-first. A weaker alias may collide on a
 	// distinct delivery, so only the strongest identity present may suppress it.
 	if len(keys) > 0 && b.replayStore.SeenAny(keys[0]) {
@@ -676,8 +686,10 @@ func (b *Bot) processRawMessage(ctx context.Context, handler MessageHandler, raw
 		return nil
 	}
 
-	b.rememberContext(&wire)
-	incoming := b.parseMessage(&wire)
+	if err := b.rememberContext(wire); err != nil {
+		return err
+	}
+	incoming := b.parseMessage(wire)
 	if incoming != nil {
 		if err := b.hooks.AfterReceive.Run(incoming); err != nil {
 			return fmt.Errorf("AfterReceive hook failed: %w", err)
@@ -1103,16 +1115,14 @@ func (b *Bot) notifyError(ctx context.Context, userID, contextToken string, err 
 	}
 }
 
-func (b *Bot) rememberContext(wire *WireMessage) {
-	userID := wire.FromUserID
-	if wire.MessageType == MessageTypeBot {
-		userID = wire.ToUserID
-	}
+func (b *Bot) rememberContext(wire *WireMessage) error {
+	userID := peerUserID(wire)
 	if userID != "" && wire.ContextToken != "" {
 		if err := b.contextTokens.Set(userID, wire.ContextToken); err != nil {
-			b.log("warn", "failed to persist context token: %v", err)
+			return fmt.Errorf("persist context token: %w", err)
 		}
 	}
+	return nil
 }
 
 func (b *Bot) parseMessage(wire *WireMessage) *IncomingMessage {

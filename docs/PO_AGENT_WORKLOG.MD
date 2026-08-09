@@ -16,6 +16,8 @@
 
 - Replaced fire-and-forget inbound callbacks with one context-aware Handler pipeline and explicit Ack/Retry/Drop outcomes; retry and hook failures now leave replay/cursor state uncommitted, handler panics request redelivery, and concurrent Run calls are rejected with lifecycle state reset on exit.
 
+- Added a bounded keyed dispatcher with same-user ordering, cross-user concurrency, bounded uncommitted batches, and an ordered cursor-completion frontier; cursor state now fails closed on load/write errors, concurrent context-token persistence and hook registration are synchronized, and the echo example is concurrency-safe.
+
 ## 2026-08-11
 
 - Closed reliable-delivery failure gaps: malformed wire messages now fail closed, replay identities are conversation-scoped and committed as one alias set, and credential/replay/cursor/context JSON state uses atomic replacement with disk-before-memory publication.

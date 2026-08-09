@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 
 	wechatbot "github.com/Icatme/wechatbot-go"
@@ -31,10 +32,10 @@ func main() {
 	}
 	fmt.Printf("Logged in: %s (%s)\n", creds.AccountID, creds.UserID)
 
-	count := 0
+	var count atomic.Int64
 	bot.Handle(wechatbot.MessageHandlerFunc(func(ctx context.Context, msg *wechatbot.IncomingMessage) wechatbot.MessageResult {
-		count++
-		fmt.Printf("[%d] %s: %s\n", count, msg.UserID, msg.Text)
+		current := count.Add(1)
+		fmt.Printf("[%d] %s: %s\n", current, msg.UserID, msg.Text)
 
 		_ = bot.SendTyping(ctx, msg.UserID)
 
@@ -48,5 +49,5 @@ func main() {
 	if err := bot.Run(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
 	}
-	fmt.Printf("Stopped. Processed %d messages.\n", count)
+	fmt.Printf("Stopped. Processed %d messages.\n", count.Load())
 }

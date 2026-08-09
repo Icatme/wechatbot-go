@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -116,5 +118,38 @@ func TestBeforeSendHookMutatesContent(t *testing.T) {
 	}
 	if content.Text != "hooked" {
 		t.Fatalf("expected hooked, got %s", content.Text)
+	}
+}
+
+func TestHookRegistrySupportsConcurrentRunAndRegistration(t *testing.T) {
+	var registry HookRegistry[int]
+	var calls atomic.Int64
+	registry.Register(func(int) error {
+		calls.Add(1)
+		return nil
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				if err := registry.Run(j); err != nil {
+					t.Errorf("run hook: %v", err)
+				}
+			}
+		}()
+	}
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			registry.Register(func(int) error { return nil })
+		}()
+	}
+	wg.Wait()
+	if calls.Load() != 16*50 {
+		t.Fatalf("base hook calls = %d, want %d", calls.Load(), 16*50)
 	}
 }

@@ -81,3 +81,18 @@ func TestCursorStoreMissingFile(t *testing.T) {
 		t.Fatal("expected empty cursor")
 	}
 }
+
+func TestCursorStoreSetFailureDoesNotPublishCursor(t *testing.T) {
+	dir := t.TempDir()
+	s := NewCursorStore("", filepath.Join(dir, "cursor.json"))
+	if err := s.Set("committed"); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+	s.path = dir
+	if err := s.Set("uncommitted"); err == nil {
+		t.Fatal("expected cursor persistence failure")
+	}
+	if got := s.Get(); got != "committed" {
+		t.Fatalf("cursor = %q, want committed", got)
+	}
+}
