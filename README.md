@@ -60,6 +60,8 @@ func main() {
 
 - 扫码登录 + 凭证持久化
 - 长轮询接收消息
+- 轮询与消息处理解耦，保持消息处理顺序
+- `message_id` / `client_id` / `seq` 持久化重放去重
 - 文本 / 图片 / 文件 / 视频 / 语音 收发
 - CDN 上传下载与 AES-128-ECB 解密
 - context_token 自动管理
