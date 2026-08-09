@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -29,18 +30,28 @@ var CDNBaseURL = "https://novac2c.cdn.weixin.qq.com/c2c"
 
 // APIError is returned when the iLink API returns a non-zero ret or HTTP error.
 type APIError struct {
+	Endpoint   string
 	Message    string
 	HTTPStatus int
+	RetCode    int
 	ErrCode    int
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("ilink api: %s (http=%d, errcode=%d)", e.Message, e.HTTPStatus, e.ErrCode)
+	return fmt.Sprintf("ilink api %s: %s (http=%d, ret=%d, errcode=%d)", e.Endpoint, e.Message, e.HTTPStatus, e.RetCode, e.ErrCode)
+}
+
+// Code returns errcode when present, otherwise ret.
+func (e *APIError) Code() int {
+	if e.ErrCode != 0 {
+		return e.ErrCode
+	}
+	return e.RetCode
 }
 
 // IsSessionExpired returns true if this error indicates session timeout.
 func (e *APIError) IsSessionExpired() bool {
-	return e.ErrCode == -14
+	return e.RetCode == -14 || e.ErrCode == -14
 }
 
 // RandomWechatUIN generates the X-WECHAT-UIN header value.
@@ -163,7 +174,7 @@ func (c *Client) GetQRCode(ctx context.Context, baseURL string, localTokenList [
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-		return nil, &APIError{Message: string(raw), HTTPStatus: resp.StatusCode}
+		return nil, responseAPIError("/ilink/bot/get_bot_qrcode", resp.StatusCode, raw)
 	}
 	var result QRCodeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -193,7 +204,7 @@ func (c *Client) PollQRStatus(ctx context.Context, baseURL, qrcode, verifyCode s
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-		return nil, &APIError{Message: string(raw), HTTPStatus: resp.StatusCode}
+		return nil, responseAPIError("/ilink/bot/get_qrcode_status", resp.StatusCode, raw)
 	}
 	var result QRStatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -230,32 +241,50 @@ func (c *Client) apiPost(ctx context.Context, baseURL, endpoint, token string, b
 	if err != nil {
 		return nil, fmt.Errorf("%s read response: %w", endpoint, err)
 	}
-	if resp.StatusCode >= 400 {
-		return nil, &APIError{Message: string(raw), HTTPStatus: resp.StatusCode}
-	}
-
-	// Check ret != 0 or errcode != 0
-	var check struct {
-		Ret     int    `json:"ret"`
-		ErrCode int    `json:"errcode"`
-		ErrMsg  string `json:"errmsg"`
-	}
+	var check apiEnvelope
 	if err := json.Unmarshal(raw, &check); err != nil {
+		if resp.StatusCode >= 400 {
+			return nil, responseAPIError(endpoint, resp.StatusCode, raw)
+		}
 		return nil, fmt.Errorf("%s decode response: %w", endpoint, err)
 	}
+	if resp.StatusCode >= 400 {
+		return nil, newAPIError(endpoint, resp.StatusCode, raw, check)
+	}
 	if check.Ret != 0 || check.ErrCode != 0 {
-		code := check.ErrCode
-		if code == 0 {
-			code = check.Ret
-		}
-		msg := check.ErrMsg
-		if msg == "" {
-			msg = fmt.Sprintf("ret=%d", check.Ret)
-		}
-		return nil, &APIError{Message: msg, HTTPStatus: resp.StatusCode, ErrCode: code}
+		return nil, newAPIError(endpoint, resp.StatusCode, raw, check)
 	}
 
 	return json.RawMessage(raw), nil
+}
+
+type apiEnvelope struct {
+	Ret     int    `json:"ret"`
+	ErrCode int    `json:"errcode"`
+	ErrMsg  string `json:"errmsg"`
+}
+
+func responseAPIError(endpoint string, status int, raw []byte) *APIError {
+	var envelope apiEnvelope
+	_ = json.Unmarshal(raw, &envelope)
+	return newAPIError(endpoint, status, raw, envelope)
+}
+
+func newAPIError(endpoint string, status int, raw []byte, envelope apiEnvelope) *APIError {
+	message := envelope.ErrMsg
+	if message == "" {
+		message = strings.TrimSpace(string(raw))
+	}
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	return &APIError{
+		Endpoint:   endpoint,
+		Message:    message,
+		HTTPStatus: status,
+		RetCode:    envelope.Ret,
+		ErrCode:    envelope.ErrCode,
+	}
 }
 
 // GetUpdates performs a long-poll for new messages.

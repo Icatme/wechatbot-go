@@ -3,6 +3,8 @@ package protocol
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,6 +43,9 @@ func TestPollQRStatusHTTPError(t *testing.T) {
 	}
 	if apiErr.HTTPStatus != http.StatusBadGateway {
 		t.Fatalf("expected HTTP 502, got %d", apiErr.HTTPStatus)
+	}
+	if apiErr.Endpoint != "/ilink/bot/get_qrcode_status" {
+		t.Fatalf("endpoint = %q", apiErr.Endpoint)
 	}
 }
 
@@ -86,5 +91,79 @@ func TestBuildMessageUsesCallerIdentityAndOptionalRunID(t *testing.T) {
 	withoutRun := BuildMessage("user-1", "context-1", "client-2", "", item)
 	if _, ok := withoutRun["run_id"]; ok {
 		t.Fatal("empty run_id should be omitted")
+	}
+}
+
+func TestAPIErrorPreservesResponseDimensions(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		wantRet     int
+		wantErrCode int
+		wantCode    int
+		wantExpired bool
+		wantMessage string
+	}{
+		{
+			name:        "ret session expired",
+			status:      http.StatusOK,
+			body:        `{"ret":-14,"errmsg":"ret expired"}`,
+			wantRet:     -14,
+			wantCode:    -14,
+			wantExpired: true,
+			wantMessage: "ret expired",
+		},
+		{
+			name:        "errcode session expired",
+			status:      http.StatusOK,
+			body:        `{"ret":0,"errcode":-14,"errmsg":"errcode expired"}`,
+			wantErrCode: -14,
+			wantCode:    -14,
+			wantExpired: true,
+			wantMessage: "errcode expired",
+		},
+		{
+			name:        "http session expired",
+			status:      http.StatusUnauthorized,
+			body:        `{"ret":-14,"errcode":-14,"errmsg":"http expired"}`,
+			wantRet:     -14,
+			wantErrCode: -14,
+			wantCode:    -14,
+			wantExpired: true,
+			wantMessage: "http expired",
+		},
+		{
+			name:        "other ret",
+			status:      http.StatusOK,
+			body:        `{"ret":-2,"errmsg":"other"}`,
+			wantRet:     -2,
+			wantCode:    -2,
+			wantMessage: "other",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			err := NewClient().SendMessage(context.Background(), server.URL, "token", map[string]interface{}{})
+			var apiErr *APIError
+			if !errors.As(fmt.Errorf("wrapped: %w", err), &apiErr) {
+				t.Fatalf("expected wrapped APIError, got %T: %v", err, err)
+			}
+			if apiErr.Endpoint != "/ilink/bot/sendmessage" || apiErr.HTTPStatus != tc.status {
+				t.Fatalf("location = endpoint %q HTTP %d", apiErr.Endpoint, apiErr.HTTPStatus)
+			}
+			if apiErr.RetCode != tc.wantRet || apiErr.ErrCode != tc.wantErrCode || apiErr.Code() != tc.wantCode {
+				t.Fatalf("codes = ret %d errcode %d effective %d", apiErr.RetCode, apiErr.ErrCode, apiErr.Code())
+			}
+			if apiErr.IsSessionExpired() != tc.wantExpired || apiErr.Message != tc.wantMessage {
+				t.Fatalf("error = %+v", apiErr)
+			}
+		})
 	}
 }

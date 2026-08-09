@@ -127,8 +127,11 @@ Messages may carry `session_id`, `group_id`, and `run_id` for Agent correlation.
 | Code | Meaning | Action |
 |------|---------|--------|
 | `ret: 0` | Success | — |
-| `errcode: -14` | Session expired | Re-login |
+| `ret: -14` or `errcode: -14` | Session expired | Re-login |
 | `ret: -2` | Parameter error | Check request |
+
+`APIError` preserves the endpoint, HTTP status, `ret`, and `errcode` separately;
+use `errors.As` to inspect it through wrapped SDK errors.
 
 ## context_token
 
