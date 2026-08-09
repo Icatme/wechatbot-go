@@ -60,30 +60,20 @@ func NewCache(opts APIOpts) *Cache {
 
 // GetForUser returns the cached config for a user, fetching if necessary.
 func (c *Cache) GetForUser(ctx context.Context, userID, contextToken string) (CachedConfig, error) {
-	c.mu.RLock()
-	e, exists := c.cache[userID]
-	c.mu.RUnlock()
-
-	now := time.Now()
-	shouldFetch := !exists || now.After(e.nextFetchAt)
-
-	if !shouldFetch {
-		return e.config, nil
-	}
-
+	c.mu.Lock()
+	e := c.cache[userID]
 	if e == nil {
 		e = &entry{}
-		c.mu.Lock()
 		c.cache[userID] = e
-		c.mu.Unlock()
 	}
+	c.mu.Unlock()
 
 	// Serialize fetches for the same user to avoid thundering herd.
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Double-check after acquiring the per-user lock (use fresh time).
-	if time.Now().Before(e.nextFetchAt) {
+	now := time.Now()
+	if now.Before(e.nextFetchAt) {
 		return e.config, nil
 	}
 

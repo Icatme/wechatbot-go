@@ -24,7 +24,6 @@ import (
 	"github.com/Icatme/wechatbot-go/internal/markdown"
 	"github.com/Icatme/wechatbot-go/internal/protocol"
 	"github.com/Icatme/wechatbot-go/internal/remote"
-	"github.com/Icatme/wechatbot-go/internal/session"
 	"github.com/Icatme/wechatbot-go/internal/store"
 	"github.com/Icatme/wechatbot-go/internal/thumb"
 	botlog "github.com/Icatme/wechatbot-go/log"
@@ -54,21 +53,28 @@ type Options struct {
 
 // Bot is the main WeChat bot client.
 type Bot struct {
-	opts          Options
-	client        *protocol.Client
-	creds         *auth.Credentials
-	configCache   *config.Cache
-	sessionGuard  *session.Guard
-	handler       MessageHandler
-	middlewares   []Middleware
-	contextTokens *store.ContextStore
-	cursorStore   *store.CursorStore
-	replayStore   *store.ReplayStore
-	running       bool
-	mu            sync.Mutex
-	cancelPoll    context.CancelFunc
-	hooks         LifecycleHooks
-	logger        loggerAdapter
+	opts               Options
+	client             *protocol.Client
+	creds              *auth.Credentials
+	configCache        *config.Cache
+	reauth             *reauthState
+	sessionGeneration  uint64
+	sessionInitialized bool
+	sessionContext     context.Context
+	cancelSession      context.CancelFunc
+	handler            MessageHandler
+	middlewares        []Middleware
+	contextTokens      *store.ContextStore
+	cursorStore        *store.CursorStore
+	replayStore        *store.ReplayStore
+	running            bool
+	mu                 sync.Mutex
+	loginMu            sync.Mutex
+	sessionMu          sync.Mutex
+	requestMu          sync.RWMutex
+	cancelPoll         context.CancelFunc
+	hooks              LifecycleHooks
+	logger             loggerAdapter
 }
 
 // New creates a new Bot instance.
@@ -106,7 +112,6 @@ func New(opts ...Options) *Bot {
 	return &Bot{
 		opts:          o,
 		client:        client,
-		sessionGuard:  session.NewGuard(),
 		contextTokens: store.NewContextStore(o.AccountID, o.ContextTokenPath),
 		cursorStore:   store.NewCursorStore(o.AccountID, o.CursorPath),
 		replayStore:   store.NewReplayStore(o.AccountID, o.ReplayPath, store.DefaultReplayTTL),
@@ -117,58 +122,170 @@ func New(opts ...Options) *Bot {
 
 // Login performs QR code login or loads stored credentials.
 func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
+	if force {
+		return b.Reauthenticate(ctx)
+	}
+	b.mu.Lock()
+	state := b.reauth
+	creds := b.creds
+	b.mu.Unlock()
+	if state != nil {
+		return nil, waitReauthState(state)
+	}
+	if creds != nil {
+		return publicCredentials(creds), nil
+	}
+	if !b.loginMu.TryLock() {
+		return nil, ErrLoginInProgress
+	}
+	defer b.loginMu.Unlock()
+	if err := b.reauthError(); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	creds = b.creds
+	b.mu.Unlock()
+	if creds != nil {
+		return publicCredentials(creds), nil
+	}
+	return b.login(ctx, false, nil)
+}
+
+// Reauthenticate explicitly performs a fresh QR login without offering or
+// accepting credentials that were invalidated by a -14 response.
+func (b *Bot) Reauthenticate(ctx context.Context) (*Credentials, error) {
+	if !b.loginMu.TryLock() {
+		return nil, ErrLoginInProgress
+	}
+	defer b.loginMu.Unlock()
+
+	state, err := b.prepareReauthentication()
+	if err != nil {
+		return nil, err
+	}
+	return b.login(ctx, true, state)
+}
+
+func (b *Bot) login(ctx context.Context, force bool, reauth *reauthState) (*Credentials, error) {
+	invalidToken := ""
+	expectedAccountID := b.opts.AccountID
+	if reauth != nil {
+		invalidToken = reauth.invalidToken
+		if reauth.accountID != "" {
+			expectedAccountID = reauth.accountID
+		}
+	}
 	creds, err := auth.Login(ctx, b.client, auth.LoginOptions{
 		BaseURL:      b.opts.BaseURL,
 		CredPath:     b.opts.CredPath,
 		Force:        force,
+		InvalidToken: invalidToken,
 		OnQRURL:      b.opts.OnQRURL,
 		OnScanned:    b.opts.OnScanned,
 		OnExpired:    b.opts.OnExpired,
 		OnVerifyCode: b.opts.OnVerifyCode,
 	})
 	if err != nil {
-		return nil, err
+		return nil, reauthenticationAttemptError(reauth, err)
+	}
+	if expectedAccountID != "" && creds.AccountID != expectedAccountID {
+		cleanupErr := auth.ClearCredentials(b.opts.CredPath)
+		return nil, reauthenticationAttemptError(reauth, errors.Join(
+			fmt.Errorf("reauthenticated account %q does not match %q", creds.AccountID, expectedAccountID),
+			cleanupErr,
+		))
 	}
 
+	if err := b.hooks.BeforeLogin.Run(publicCredentials(creds)); err != nil {
+		b.log("warn", "BeforeLogin hook failed: %v", err)
+	}
+
+	accountID := b.opts.AccountID
+	if accountID == "" {
+		accountID = creds.AccountID
+	}
+	contextTokens := b.contextTokens
+	cursorStore := b.cursorStore
+	replayStore := b.replayStore
+	if reauth == nil && b.opts.ContextTokenPath == "" {
+		contextTokens = store.NewContextStore(accountID, "")
+	}
+	if reauth == nil && b.opts.CursorPath == "" {
+		cursorStore = store.NewCursorStore(accountID, "")
+	}
+	if reauth == nil && b.opts.ReplayPath == "" {
+		replayStore = store.NewReplayStore(accountID, "", store.DefaultReplayTTL)
+	}
+	b.sessionMu.Lock()
+	if force {
+		if err := contextTokens.Clear(); err != nil {
+			b.sessionMu.Unlock()
+			cleanupErr := auth.ClearCredentials(b.opts.CredPath)
+			return nil, reauthenticationAttemptError(reauth, errors.Join(fmt.Errorf("clear context tokens for reauthentication: %w", err), cleanupErr))
+		}
+	} else if err := contextTokens.Load(); err != nil {
+		b.log("warn", "Failed to load context tokens: %v", err)
+	}
+
+	b.requestMu.Lock()
 	b.mu.Lock()
+	currentReauth := b.reauth
+	if (reauth == nil && currentReauth != nil) || (reauth != nil && currentReauth != reauth) {
+		b.mu.Unlock()
+		b.requestMu.Unlock()
+		b.sessionMu.Unlock()
+		cleanupErr := auth.ClearCredentials(b.opts.CredPath)
+		return nil, reauthenticationAttemptError(reauth, errors.Join(
+			fmt.Errorf("login state changed while credentials were being acquired"),
+			waitReauthState(currentReauth),
+			cleanupErr,
+		))
+	}
+	nextGeneration := b.sessionGeneration + 1
+	nextSessionContext, cancelNextSession := context.WithCancel(context.Background())
+	previousCancelSession := b.cancelSession
+	configCache := b.newConfigCache(creds, nextGeneration)
 	b.creds = creds
+	b.configCache = configCache
+	b.contextTokens = contextTokens
+	b.cursorStore = cursorStore
+	b.replayStore = replayStore
 	b.opts.BaseURL = creds.BaseURL
-	if b.opts.AccountID == "" {
-		b.opts.AccountID = creds.AccountID
-	}
-	b.configCache = config.NewCache(config.APIOpts{
-		BaseURL: creds.BaseURL,
-		Token:   creds.Token,
-		Client:  b.client,
-	})
-	if b.opts.ContextTokenPath == "" {
-		b.contextTokens = store.NewContextStore(b.opts.AccountID, "")
-	}
-	if b.opts.CursorPath == "" {
-		b.cursorStore = store.NewCursorStore(b.opts.AccountID, "")
-	}
-	if b.opts.ReplayPath == "" {
-		b.replayStore = store.NewReplayStore(b.opts.AccountID, "", store.DefaultReplayTTL)
-	}
+	b.opts.AccountID = accountID
+	b.sessionGeneration = nextGeneration
+	b.sessionInitialized = true
+	b.sessionContext = nextSessionContext
+	b.cancelSession = cancelNextSession
+	b.reauth = nil
 	b.mu.Unlock()
-
-	if loadErr := b.contextTokens.Load(); loadErr != nil {
-		b.log("warn", "Failed to load context tokens: %v", loadErr)
+	b.requestMu.Unlock()
+	b.sessionMu.Unlock()
+	if previousCancelSession != nil {
+		previousCancelSession()
 	}
 
 	b.log("info", "Logged in as %s", creds.UserID)
+	if err := b.hooks.AfterLogin.Run(publicCredentials(creds)); err != nil {
+		b.log("warn", "AfterLogin hook failed: %v", err)
+	}
+	return publicCredentials(creds), nil
+}
 
-	public := &Credentials{
+func reauthenticationAttemptError(state *reauthState, err error) error {
+	if state == nil {
+		return err
+	}
+	return errors.Join(err, waitReauthState(state))
+}
+
+func publicCredentials(creds *auth.Credentials) *Credentials {
+	return &Credentials{
 		Token:     creds.Token,
 		BaseURL:   creds.BaseURL,
 		AccountID: creds.AccountID,
 		UserID:    creds.UserID,
 		SavedAt:   creds.SavedAt,
 	}
-	if err := b.hooks.AfterLogin.Run(public); err != nil {
-		b.log("warn", "AfterLogin hook failed: %v", err)
-	}
-	return public, nil
 }
 
 // Handle sets the single inbound message handler. Replacing the handler while
@@ -194,14 +311,24 @@ func (b *Bot) Hooks() *LifecycleHooks {
 
 // Reply sends a text reply to an incoming message.
 func (b *Bot) Reply(ctx context.Context, msg *IncomingMessage, text string) error {
+	if msg == nil {
+		return fmt.Errorf("inbound message is nil")
+	}
+	sessionGeneration, err := b.incomingSessionGeneration(msg)
+	if err != nil {
+		return err
+	}
 	if err := requireContextToken(msg.UserID, msg.ContextToken); err != nil {
 		return err
 	}
-	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
+	if err := b.persistContextToken(sessionGeneration, msg.UserID, msg.ContextToken); err != nil {
+		if errors.Is(err, ErrReauthRequired) {
+			return err
+		}
 		b.log("warn", "failed to persist context token: %v", err)
 	}
-	if err := b.sendText(ctx, msg.UserID, text, msg.ContextToken); err != nil {
-		b.notifyError(ctx, msg.UserID, msg.ContextToken, err)
+	if err := b.sendText(ctx, sessionGeneration, msg.UserID, text, msg.ContextToken); err != nil {
+		b.notifyError(ctx, sessionGeneration, msg.UserID, msg.ContextToken, err)
 		return err
 	}
 	return nil
@@ -209,12 +336,16 @@ func (b *Bot) Reply(ctx context.Context, msg *IncomingMessage, text string) erro
 
 // Send sends a text message to a user (requires prior context_token).
 func (b *Bot) Send(ctx context.Context, userID, text string) error {
+	_, sessionGeneration, err := b.readySessionForContext(ctx)
+	if err != nil {
+		return err
+	}
 	ct := b.contextTokens.Get(userID)
 	if err := requireContextToken(userID, ct); err != nil {
 		return err
 	}
-	if err := b.sendText(ctx, userID, text, ct); err != nil {
-		b.notifyError(ctx, userID, ct, err)
+	if err := b.sendText(ctx, sessionGeneration, userID, text, ct); err != nil {
+		b.notifyError(ctx, sessionGeneration, userID, ct, err)
 		return err
 	}
 	return nil
@@ -222,42 +353,64 @@ func (b *Bot) Send(ctx context.Context, userID, text string) error {
 
 // SendTyping shows the "typing..." indicator.
 func (b *Bot) SendTyping(ctx context.Context, userID string) error {
+	creds, configCache, sessionGeneration, err := b.readyConfig(ctx)
+	if err != nil {
+		return err
+	}
 	ct := b.contextTokens.Get(userID)
 	if err := requireContextToken(userID, ct); err != nil {
 		return err
 	}
-	creds, configCache, err := b.readyConfig()
-	if err != nil {
-		return err
-	}
 	cfg, err := configCache.GetForUser(ctx, userID, ct)
+	if err != nil {
+		return b.handleAuthenticatedErrorForSession(sessionGeneration, creds.Token, err)
+	}
+	creds, err = b.readySession(sessionGeneration)
 	if err != nil {
 		return err
 	}
 	if cfg.TypingTicket == "" {
 		return nil
 	}
-	return b.client.SendTyping(ctx, creds.BaseURL, creds.Token, userID, cfg.TypingTicket, 1)
+	return b.sendTypingForSession(ctx, sessionGeneration, userID, cfg.TypingTicket, 1)
 }
 
 // StopTyping cancels the "typing..." indicator.
 func (b *Bot) StopTyping(ctx context.Context, userID string) error {
+	creds, configCache, sessionGeneration, err := b.readyConfig(ctx)
+	if err != nil {
+		return err
+	}
 	ct := b.contextTokens.Get(userID)
 	if ct == "" {
 		return nil
 	}
-	creds, configCache, err := b.readyConfig()
-	if err != nil {
-		return err
-	}
 	cfg, err := configCache.GetForUser(ctx, userID, ct)
+	if err != nil {
+		return b.handleAuthenticatedErrorForSession(sessionGeneration, creds.Token, err)
+	}
+	creds, err = b.readySession(sessionGeneration)
 	if err != nil {
 		return err
 	}
 	if cfg.TypingTicket == "" {
 		return nil
 	}
-	return b.client.SendTyping(ctx, creds.BaseURL, creds.Token, userID, cfg.TypingTicket, 2)
+	return b.sendTypingForSession(ctx, sessionGeneration, userID, cfg.TypingTicket, 2)
+}
+
+func (b *Bot) sendTypingForSession(ctx context.Context, sessionGeneration uint64, userID, ticket string, status int) error {
+	token, sendErr := b.authenticatedRequest(ctx, sessionGeneration, func(requestContext context.Context, baseURL, token string) error {
+		return b.client.SendTyping(requestContext, baseURL, token, userID, ticket, status)
+	})
+	if token == "" {
+		return sendErr
+	}
+	if err := b.handleAuthenticatedErrorForSession(sessionGeneration, token, sendErr); err != nil {
+		return err
+	}
+	_, err := b.readySession(sessionGeneration)
+	return err
 }
 
 // SendContent describes what to send. Use one of:
@@ -340,21 +493,28 @@ func SendFileURL(url, fileName string) SendContent {
 
 // ReplyContent replies with any content type.
 func (b *Bot) ReplyContent(ctx context.Context, msg *IncomingMessage, content SendContent) error {
+	if msg == nil {
+		return fmt.Errorf("inbound message is nil")
+	}
+	sessionGeneration, err := b.incomingSessionGeneration(msg)
+	if err != nil {
+		return err
+	}
 	if err := requireContextToken(msg.UserID, msg.ContextToken); err != nil {
 		return err
 	}
-	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
+	if err := b.persistContextToken(sessionGeneration, msg.UserID, msg.ContextToken); err != nil {
+		if errors.Is(err, ErrReauthRequired) {
+			return err
+		}
 		b.log("warn", "failed to persist context token: %v", err)
-	}
-	if _, err := b.readyCreds(); err != nil {
-		return err
 	}
 	resolved, err := content.resolveRemote(ctx, b.client.HTTP)
 	if err != nil {
 		return err
 	}
-	if err := b.sendContent(ctx, msg.UserID, msg.ContextToken, resolved); err != nil {
-		b.notifyError(ctx, msg.UserID, msg.ContextToken, err)
+	if err := b.sendContent(ctx, sessionGeneration, msg.UserID, msg.ContextToken, resolved); err != nil {
+		b.notifyError(ctx, sessionGeneration, msg.UserID, msg.ContextToken, err)
 		return err
 	}
 	return nil
@@ -362,19 +522,20 @@ func (b *Bot) ReplyContent(ctx context.Context, msg *IncomingMessage, content Se
 
 // SendMedia sends any content type to a user.
 func (b *Bot) SendMedia(ctx context.Context, userID string, content SendContent) error {
-	ct := b.contextTokens.Get(userID)
-	if err := requireContextToken(userID, ct); err != nil {
+	_, sessionGeneration, err := b.readySessionForContext(ctx)
+	if err != nil {
 		return err
 	}
-	if _, err := b.readyCreds(); err != nil {
+	ct := b.contextTokens.Get(userID)
+	if err := requireContextToken(userID, ct); err != nil {
 		return err
 	}
 	resolved, err := content.resolveRemote(ctx, b.client.HTTP)
 	if err != nil {
 		return err
 	}
-	if err := b.sendContent(ctx, userID, ct, resolved); err != nil {
-		b.notifyError(ctx, userID, ct, err)
+	if err := b.sendContent(ctx, sessionGeneration, userID, ct, resolved); err != nil {
+		b.notifyError(ctx, sessionGeneration, userID, ct, err)
 		return err
 	}
 	return nil
@@ -429,36 +590,49 @@ func (b *Bot) DownloadRaw(ctx context.Context, media *CDNMedia, aeskeyOverride s
 
 // Upload uploads data to WeChat CDN without sending a message.
 func (b *Bot) Upload(ctx context.Context, data []byte, userID string, mediaType int) (*UploadResult, error) {
-	creds, err := b.readyCreds()
+	_, sessionGeneration, err := b.readySessionForContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return b.cdnUpload(ctx, creds, data, userID, mediaType)
+	return b.cdnUpload(ctx, sessionGeneration, data, userID, mediaType)
 }
 
 const updateQueueCapacity = 16
 
 type updateBatch struct {
-	messages []json.RawMessage
-	cursor   string
+	messages          []json.RawMessage
+	cursor            string
+	sessionGeneration uint64
 }
 
-func (b *Bot) beginRun(ctx context.Context) (*auth.Credentials, MessageHandler, context.Context, context.CancelFunc, error) {
+type authenticatedSession struct {
+	creds      *auth.Credentials
+	generation uint64
+}
+
+type handlerSessionGenerationKey struct{}
+
+func (b *Bot) beginRun(ctx context.Context) (authenticatedSession, MessageHandler, context.Context, context.CancelFunc, error) {
 	b.mu.Lock()
 	if b.running {
 		b.mu.Unlock()
-		return nil, nil, nil, nil, ErrAlreadyRunning
+		return authenticatedSession{}, nil, nil, nil, ErrAlreadyRunning
+	}
+	if state := b.reauth; state != nil {
+		b.mu.Unlock()
+		return authenticatedSession{}, nil, nil, nil, waitReauthState(state)
 	}
 	if b.creds == nil {
 		b.mu.Unlock()
-		return nil, nil, nil, nil, fmt.Errorf("not logged in; call Login() first")
+		return authenticatedSession{}, nil, nil, nil, fmt.Errorf("%w; call Login() first", ErrNotLoggedIn)
 	}
 	if b.handler == nil {
 		b.mu.Unlock()
-		return nil, nil, nil, nil, ErrNoMessageHandler
+		return authenticatedSession{}, nil, nil, nil, ErrNoMessageHandler
 	}
 
-	creds := b.creds
+	session := authenticatedSession{creds: b.creds, generation: b.sessionGeneration}
+	b.sessionInitialized = true
 	handler := b.handler
 	middlewares := append([]Middleware(nil), b.middlewares...)
 	pollCtx, cancel := context.WithCancel(ctx)
@@ -469,9 +643,9 @@ func (b *Bot) beginRun(ctx context.Context) (*auth.Credentials, MessageHandler, 
 	handler, err := composeHandler(handler, middlewares)
 	if err != nil {
 		b.finishRun(cancel)
-		return nil, nil, nil, nil, err
+		return authenticatedSession{}, nil, nil, nil, err
 	}
-	return creds, handler, pollCtx, cancel, nil
+	return session, handler, pollCtx, cancel, nil
 }
 
 func (b *Bot) finishRun(cancel context.CancelFunc) {
@@ -484,12 +658,15 @@ func (b *Bot) finishRun(cancel context.CancelFunc) {
 
 // Run starts the long-poll loop. It blocks until Stop is called, ctx is
 // cancelled, or a delivery requests retry. Only one Run may be active.
-func (b *Bot) Run(ctx context.Context) error {
-	creds, handler, pollCtx, cancel, err := b.beginRun(ctx)
+func (b *Bot) Run(ctx context.Context) (runErr error) {
+	session, handler, pollCtx, cancel, err := b.beginRun(ctx)
 	if err != nil {
 		return err
 	}
 	defer b.finishRun(cancel)
+	defer func() {
+		runErr = b.normalizeSessionChangeError(session.generation, runErr)
+	}()
 
 	b.log("info", "Long-poll loop started")
 	if loadErr := b.cursorStore.Load(); loadErr != nil {
@@ -498,25 +675,35 @@ func (b *Bot) Run(ctx context.Context) error {
 	if err := b.replayStore.Load(); err != nil {
 		return fmt.Errorf("load replay state: %w", err)
 	}
-
-	if err := b.hooks.BeforeLogin.Run(&Credentials{
-		Token:     creds.Token,
-		BaseURL:   creds.BaseURL,
-		AccountID: creds.AccountID,
-		UserID:    creds.UserID,
-		SavedAt:   creds.SavedAt,
-	}); err != nil {
-		b.log("warn", "BeforeLogin hook failed: %v", err)
+	notifyStartToken, notifyStartErr := b.authenticatedRequest(pollCtx, session.generation, func(requestContext context.Context, baseURL, token string) error {
+		return b.client.NotifyStart(requestContext, baseURL, token)
+	})
+	if notifyStartToken == "" {
+		return notifyStartErr
 	}
-	if err := b.client.NotifyStart(pollCtx, creds.BaseURL, creds.Token); err != nil {
+	if err := notifyStartErr; err != nil {
+		err = b.handleAuthenticatedErrorForSession(session.generation, notifyStartToken, err)
+		if errors.Is(err, ErrReauthRequired) {
+			return err
+		}
 		b.log("warn", "NotifyStart failed: %v", err)
 	}
 	defer func() {
-		stopCreds := b.getCreds()
-		if stopCreds == nil {
+		stopToken, stopErr := b.authenticatedRequest(context.Background(), session.generation, func(requestContext context.Context, baseURL, token string) error {
+			return b.client.NotifyStop(requestContext, baseURL, token)
+		})
+		if stopToken == "" {
 			return
 		}
-		if stopErr := b.client.NotifyStop(context.Background(), stopCreds.BaseURL, stopCreds.Token); stopErr != nil {
+		if stopToken != session.creds.Token {
+			return
+		}
+		if stopErr != nil {
+			stopErr = b.handleAuthenticatedErrorForSession(session.generation, stopToken, stopErr)
+			if errors.Is(stopErr, ErrReauthRequired) {
+				runErr = errors.Join(runErr, stopErr)
+				return
+			}
 			b.log("warn", "NotifyStop failed: %v", stopErr)
 		}
 	}()
@@ -544,14 +731,20 @@ func (b *Bot) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+	sessionErr := func() error {
+		return b.sessionError(session.generation)
+	}
 	stopResult := func() error {
 		cancel()
 		<-processorDone
-		if err := processorErr(); err != nil {
-			return err
+		result := processorErr()
+		if err := sessionErr(); err != nil {
+			result = errors.Join(result, err)
 		}
-		b.log("info", "Long-poll loop stopped")
-		return nil
+		if result == nil {
+			b.log("info", "Long-poll loop stopped")
+		}
+		return result
 	}
 
 	retryDelay := time.Second
@@ -560,7 +753,7 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	for {
 		if err := processorErr(); err != nil {
-			return err
+			return errors.Join(err, sessionErr())
 		}
 		select {
 		case <-pollCtx.Done():
@@ -568,31 +761,19 @@ func (b *Bot) Run(ctx context.Context) error {
 		default:
 		}
 
-		if remaining := b.sessionGuard.Remaining(); remaining > 0 {
-			b.log("warn", "Session paused, waiting %v", remaining.Round(time.Second))
-			timer := time.NewTimer(remaining)
-			select {
-			case <-pollCtx.Done():
-				timer.Stop()
-				return stopResult()
-			case <-timer.C:
-				continue
-			}
+		updates, requestToken, err := authenticatedRequestResult(b, pollCtx, session.generation, func(requestContext context.Context, baseURL, token string) (*protocol.GetUpdatesResponse, error) {
+			return b.client.GetUpdates(requestContext, baseURL, token, pollCursor, pollTimeout)
+		})
+		if requestToken == "" {
+			return errors.Join(err, stopResult())
 		}
-
-		creds = b.getCreds()
-		updates, err := b.client.GetUpdates(pollCtx, creds.BaseURL, creds.Token, pollCursor, pollTimeout)
 		if err != nil {
+			err = b.handleAuthenticatedErrorForSession(session.generation, requestToken, err)
+			if errors.Is(err, ErrReauthRequired) {
+				return errors.Join(err, stopResult())
+			}
 			if pollCtx.Err() != nil {
 				return stopResult()
-			}
-
-			var apiErr *protocol.APIError
-			if errors.As(err, &apiErr) && apiErr.IsSessionExpired() {
-				b.log("warn", "Session expired — pausing for %v", session.PauseDuration)
-				b.sessionGuard.Pause()
-				retryDelay = time.Second
-				continue
 			}
 
 			b.reportError(err)
@@ -617,12 +798,12 @@ func (b *Bot) Run(ctx context.Context) error {
 			nextCursor = updates.GetUpdatesBuf
 		}
 		if len(updates.Msgs) > 0 || nextCursor != pollCursor {
-			batch := updateBatch{messages: updates.Msgs, cursor: nextCursor}
+			batch := updateBatch{messages: updates.Msgs, cursor: nextCursor, sessionGeneration: session.generation}
 			select {
 			case batches <- batch:
 				pollCursor = nextCursor
 			case err := <-processorErrCh:
-				return fmt.Errorf("process updates: %w", err)
+				return errors.Join(fmt.Errorf("process updates: %w", err), sessionErr())
 			case <-pollCtx.Done():
 				return stopResult()
 			}
@@ -658,7 +839,7 @@ func (b *Bot) processUpdateBatch(ctx context.Context, handler MessageHandler, ba
 		if err != nil {
 			return err
 		}
-		if err := b.processWireMessage(ctx, handler, wire); err != nil {
+		if err := b.processWireMessage(ctx, handler, batch.sessionGeneration, wire); err != nil {
 			return err
 		}
 	}
@@ -678,7 +859,10 @@ func (b *Bot) decodeWireMessage(rawMsg json.RawMessage) (*WireMessage, error) {
 	return &wire, nil
 }
 
-func (b *Bot) processWireMessage(ctx context.Context, handler MessageHandler, wire *WireMessage) error {
+func (b *Bot) processWireMessage(ctx context.Context, handler MessageHandler, sessionGeneration uint64, wire *WireMessage) error {
+	if err := b.validateDeliverySession(sessionGeneration); err != nil {
+		return err
+	}
 	keys := replayKeys(wire)
 	// replayKeys orders aliases strongest-first. A weaker alias may collide on a
 	// distinct delivery, so only the strongest identity present may suppress it.
@@ -687,15 +871,18 @@ func (b *Bot) processWireMessage(ctx context.Context, handler MessageHandler, wi
 		return nil
 	}
 
-	if err := b.rememberContext(wire); err != nil {
+	if err := b.rememberContextForSession(sessionGeneration, wire); err != nil {
 		return err
 	}
 	incoming := b.parseMessage(wire)
 	if incoming != nil {
+		incoming.sessionGeneration = sessionGeneration
+		incoming.sessionBound = true
 		if err := b.hooks.AfterReceive.Run(incoming); err != nil {
 			return fmt.Errorf("AfterReceive hook failed: %w", err)
 		}
-		result := b.invokeHandler(ctx, handler, incoming)
+		handlerCtx := context.WithValue(ctx, handlerSessionGenerationKey{}, sessionGeneration)
+		result := b.invokeHandler(handlerCtx, handler, incoming)
 		if err := validateMessageResult(result); err != nil {
 			return fmt.Errorf("handle message: %w", err)
 		}
@@ -703,7 +890,6 @@ func (b *Bot) processWireMessage(ctx context.Context, handler MessageHandler, wi
 			b.log("warn", "Message intentionally dropped: %v", result.Err)
 		}
 	}
-
 	if len(keys) > 0 {
 		if err := b.replayStore.CommitAll(keys...); err != nil {
 			return fmt.Errorf("commit replay identities %v: %w", keys, err)
@@ -768,48 +954,194 @@ func requireContextToken(userID, contextToken string) error {
 }
 
 func (b *Bot) readyCreds() (*auth.Credentials, error) {
-	if err := b.sessionGuard.AssertActive(); err != nil {
-		return nil, err
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.creds == nil {
-		return nil, fmt.Errorf("not logged in; call Login() first")
-	}
-	return b.creds, nil
+	creds, _, err := b.readySessionSnapshot()
+	return creds, err
 }
 
-func (b *Bot) readyConfig() (*auth.Credentials, *config.Cache, error) {
-	creds, err := b.readyCreds()
+func (b *Bot) readySessionSnapshot() (*auth.Credentials, uint64, error) {
+	b.mu.Lock()
+	state := b.reauth
+	creds := b.creds
+	generation := b.sessionGeneration
+	b.mu.Unlock()
+	if state != nil {
+		return nil, 0, waitReauthState(state)
+	}
+	if creds == nil {
+		return nil, 0, fmt.Errorf("%w; call Login() first", ErrNotLoggedIn)
+	}
+	return creds, generation, nil
+}
+
+func (b *Bot) readySession(generation uint64) (*auth.Credentials, error) {
+	b.mu.Lock()
+	state := b.reauth
+	creds := b.creds
+	currentGeneration := b.sessionGeneration
+	b.mu.Unlock()
+	if currentGeneration != generation {
+		return nil, ErrSessionChanged
+	}
+	if state != nil {
+		return nil, waitReauthState(state)
+	}
+	if creds == nil {
+		return nil, fmt.Errorf("%w; call Login() first", ErrNotLoggedIn)
+	}
+	return creds, nil
+}
+
+func (b *Bot) beginAuthenticatedRequest(ctx context.Context, generation uint64) (*auth.Credentials, context.Context, func(), error) {
+	b.requestMu.RLock()
+	b.mu.Lock()
+	state := b.reauth
+	creds := b.creds
+	currentGeneration := b.sessionGeneration
+	sessionContext := b.sessionContext
+	b.mu.Unlock()
+	if currentGeneration != generation {
+		b.requestMu.RUnlock()
+		return nil, nil, nil, ErrSessionChanged
+	}
+	if state != nil {
+		b.requestMu.RUnlock()
+		return nil, nil, nil, waitReauthState(state)
+	}
+	if creds == nil {
+		b.requestMu.RUnlock()
+		return nil, nil, nil, fmt.Errorf("%w; call Login() first", ErrNotLoggedIn)
+	}
+	if sessionContext == nil {
+		return creds, ctx, b.requestMu.RUnlock, nil
+	}
+	requestContext, cancelRequest := context.WithCancel(ctx)
+	stopSessionCancel := context.AfterFunc(sessionContext, cancelRequest)
+	if sessionContext.Err() != nil {
+		cancelRequest()
+	}
+	finishRequest := func() {
+		stopSessionCancel()
+		cancelRequest()
+		b.requestMu.RUnlock()
+	}
+	return creds, requestContext, finishRequest, nil
+}
+
+func (b *Bot) authenticatedRequest(ctx context.Context, generation uint64, call func(context.Context, string, string) error) (string, error) {
+	creds, requestContext, finishRequest, err := b.beginAuthenticatedRequest(ctx, generation)
 	if err != nil {
-		return nil, nil, err
+		return "", err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.configCache == nil {
-		return nil, nil, fmt.Errorf("not logged in; call Login() first")
-	}
-	return creds, b.configCache, nil
+	defer finishRequest()
+	return creds.Token, call(requestContext, creds.BaseURL, creds.Token)
 }
 
-func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, content SendContent) error {
+func authenticatedRequestResult[T any](b *Bot, ctx context.Context, generation uint64, call func(context.Context, string, string) (T, error)) (T, string, error) {
+	var zero T
+	creds, requestContext, finishRequest, err := b.beginAuthenticatedRequest(ctx, generation)
+	if err != nil {
+		return zero, "", err
+	}
+	defer finishRequest()
+	result, err := call(requestContext, creds.BaseURL, creds.Token)
+	return result, creds.Token, err
+}
+
+func (b *Bot) validateDeliverySession(generation uint64) error {
+	b.mu.Lock()
+	initialized := b.sessionInitialized
+	b.mu.Unlock()
+	if !initialized {
+		return nil
+	}
+	_, err := b.readySession(generation)
+	return err
+}
+
+func (b *Bot) readySessionForContext(ctx context.Context) (*auth.Credentials, uint64, error) {
+	if ctx != nil {
+		if generation, ok := ctx.Value(handlerSessionGenerationKey{}).(uint64); ok {
+			creds, err := b.readySession(generation)
+			return creds, generation, err
+		}
+	}
+	return b.readySessionSnapshot()
+}
+
+func (b *Bot) incomingSessionGeneration(msg *IncomingMessage) (uint64, error) {
+	if msg.sessionBound {
+		if _, err := b.readySession(msg.sessionGeneration); err != nil {
+			return 0, err
+		}
+		return msg.sessionGeneration, nil
+	}
+	_, generation, err := b.readySessionSnapshot()
+	return generation, err
+}
+
+type generationConfigProvider struct {
+	bot        *Bot
+	generation uint64
+}
+
+func (p generationConfigProvider) GetConfig(ctx context.Context, _, _ string, userID, contextToken string) (*protocol.GetConfigResponse, error) {
+	resp, _, err := authenticatedRequestResult(p.bot, ctx, p.generation, func(requestContext context.Context, baseURL, token string) (*protocol.GetConfigResponse, error) {
+		return p.bot.client.GetConfig(requestContext, baseURL, token, userID, contextToken)
+	})
+	return resp, err
+}
+
+func (b *Bot) newConfigCache(creds *auth.Credentials, generation uint64) *config.Cache {
+	return config.NewCache(config.APIOpts{
+		BaseURL: creds.BaseURL,
+		Token:   creds.Token,
+		Client: generationConfigProvider{
+			bot:        b,
+			generation: generation,
+		},
+	})
+}
+
+func (b *Bot) readyConfig(ctx context.Context) (*auth.Credentials, *config.Cache, uint64, error) {
+	expectedGeneration, bound := uint64(0), false
+	if ctx != nil {
+		expectedGeneration, bound = ctx.Value(handlerSessionGenerationKey{}).(uint64)
+	}
+	b.mu.Lock()
+	state := b.reauth
+	creds := b.creds
+	configCache := b.configCache
+	generation := b.sessionGeneration
+	b.mu.Unlock()
+	if bound && expectedGeneration != generation {
+		return nil, nil, 0, ErrSessionChanged
+	}
+	if state != nil {
+		return nil, nil, 0, waitReauthState(state)
+	}
+	if creds == nil || configCache == nil {
+		return nil, nil, 0, fmt.Errorf("%w; call Login() first", ErrNotLoggedIn)
+	}
+	return creds, configCache, generation, nil
+}
+
+func (b *Bot) sendContent(ctx context.Context, sessionGeneration uint64, userID, contextToken string, content SendContent) error {
 	if err := requireContextToken(userID, contextToken); err != nil {
 		return err
 	}
 
 	// Text-only path.
 	if content.Text != "" {
-		return b.sendText(ctx, userID, content.Text, contextToken)
+		return b.sendText(ctx, sessionGeneration, userID, content.Text, contextToken)
 	}
 
-	creds := b.getCreds()
-	if creds == nil {
-		return fmt.Errorf("not logged in; call Login() first")
+	if _, err := b.readySession(sessionGeneration); err != nil {
+		return err
 	}
 
 	// Send caption as a separate text message first, then send the media.
 	if content.Caption != "" {
-		if err := b.sendText(ctx, userID, content.Caption, contextToken); err != nil {
+		if err := b.sendText(ctx, sessionGeneration, userID, content.Caption, contextToken); err != nil {
 			return err
 		}
 	}
@@ -820,7 +1152,7 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		if thumbData == nil {
 			thumbData = thumb.Placeholder()
 		}
-		result, err := b.cdnUploadWithThumb(ctx, creds, content.Image, thumbData, userID, int(MediaImage))
+		result, err := b.cdnUploadWithThumb(ctx, sessionGeneration, content.Image, thumbData, userID, int(MediaImage))
 		if err != nil {
 			return err
 		}
@@ -831,7 +1163,7 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		if result.ThumbMedia.EncryptQueryParam != "" {
 			imageItem.ThumbMedia = &result.ThumbMedia
 		}
-		_, err = b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+		_, err = b.sendMessage(ctx, sessionGeneration, userID, contextToken, OutboundMessage{Item: MessageItem{
 			Type:      ItemImage,
 			ImageItem: imageItem,
 		}})
@@ -842,7 +1174,7 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 	if content.Video != nil {
 		// Go has no standard video frame extraction; use a placeholder thumbnail.
 		thumbData := thumb.Placeholder()
-		result, err := b.cdnUploadWithThumb(ctx, creds, content.Video, thumbData, userID, int(MediaVideo))
+		result, err := b.cdnUploadWithThumb(ctx, sessionGeneration, content.Video, thumbData, userID, int(MediaVideo))
 		if err != nil {
 			return err
 		}
@@ -853,7 +1185,7 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		if result.ThumbMedia.EncryptQueryParam != "" {
 			videoItem.ThumbMedia = &result.ThumbMedia
 		}
-		_, err = b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+		_, err = b.sendMessage(ctx, sessionGeneration, userID, contextToken, OutboundMessage{Item: MessageItem{
 			Type:      ItemVideo,
 			VideoItem: videoItem,
 		}})
@@ -868,17 +1200,17 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		}
 		cat := categorizeByExtension(fileName)
 		if cat == "image" {
-			return b.sendContent(ctx, userID, contextToken, SendContent{Image: content.File})
+			return b.sendContent(ctx, sessionGeneration, userID, contextToken, SendContent{Image: content.File})
 		}
 		if cat == "video" {
-			return b.sendContent(ctx, userID, contextToken, SendContent{Video: content.File})
+			return b.sendContent(ctx, sessionGeneration, userID, contextToken, SendContent{Video: content.File})
 		}
 		// Generic file
-		result, err := b.cdnUpload(ctx, creds, content.File, userID, int(MediaFile))
+		result, err := b.cdnUpload(ctx, sessionGeneration, content.File, userID, int(MediaFile))
 		if err != nil {
 			return err
 		}
-		_, err = b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+		_, err = b.sendMessage(ctx, sessionGeneration, userID, contextToken, OutboundMessage{Item: MessageItem{
 			Type: ItemFile,
 			FileItem: &FileItem{
 				Media:    &result.Media,
@@ -949,11 +1281,11 @@ func (b *Bot) cdnDownload(ctx context.Context, media *CDNMedia, aeskeyOverride s
 	return crypto.DecryptAESECB(ciphertext, aesKey)
 }
 
-func (b *Bot) cdnUpload(ctx context.Context, creds *auth.Credentials, data []byte, userID string, mediaType int) (*UploadResult, error) {
-	return b.cdnUploadWithThumb(ctx, creds, data, nil, userID, mediaType)
+func (b *Bot) cdnUpload(ctx context.Context, sessionGeneration uint64, data []byte, userID string, mediaType int) (*UploadResult, error) {
+	return b.cdnUploadWithThumb(ctx, sessionGeneration, data, nil, userID, mediaType)
 }
 
-func (b *Bot) cdnUploadWithThumb(ctx context.Context, creds *auth.Credentials, data, thumbData []byte, userID string, mediaType int) (*UploadResult, error) {
+func (b *Bot) cdnUploadWithThumb(ctx context.Context, sessionGeneration uint64, data, thumbData []byte, userID string, mediaType int) (*UploadResult, error) {
 	aesKey, err := crypto.GenerateAESKey()
 	if err != nil {
 		return nil, fmt.Errorf("generate aes key: %w", err)
@@ -997,9 +1329,14 @@ func (b *Bot) cdnUploadWithThumb(ctx context.Context, creds *auth.Credentials, d
 		thumbReq.ThumbFileMD5 = hex.EncodeToString(thumbMD5[:])
 		thumbReq.ThumbFileSize = len(thumbCipher)
 	}
-	uploadResp, err := b.client.GetUploadURL(ctx, creds.BaseURL, creds.Token, thumbReq)
+	uploadResp, requestToken, err := authenticatedRequestResult(b, ctx, sessionGeneration, func(requestContext context.Context, baseURL, token string) (*protocol.GetUploadURLResponse, error) {
+		return b.client.GetUploadURL(requestContext, baseURL, token, thumbReq)
+	})
+	if requestToken == "" {
+		return nil, err
+	}
 	if err != nil {
-		return nil, fmt.Errorf("getuploadurl: %w", err)
+		return nil, fmt.Errorf("getuploadurl: %w", b.handleAuthenticatedErrorForSession(sessionGeneration, requestToken, err))
 	}
 	uploadURL := uploadResp.UploadFullURL
 	if uploadURL == "" {
@@ -1042,6 +1379,9 @@ func (b *Bot) cdnUploadWithThumb(ctx context.Context, creds *auth.Credentials, d
 			}
 		}
 	}
+	if _, err := b.readySession(sessionGeneration); err != nil {
+		return nil, err
+	}
 
 	return result, nil
 }
@@ -1065,7 +1405,7 @@ func categorizeByExtension(filename string) string {
 	return "file"
 }
 
-func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) error {
+func (b *Bot) sendText(ctx context.Context, sessionGeneration uint64, userID, text, contextToken string) error {
 	if err := requireContextToken(userID, contextToken); err != nil {
 		return err
 	}
@@ -1074,7 +1414,7 @@ func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) e
 	}
 	chunks := chunkText(text, maxTextChars)
 	for _, chunk := range chunks {
-		_, err := b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+		_, err := b.sendMessage(ctx, sessionGeneration, userID, contextToken, OutboundMessage{Item: MessageItem{
 			Type:     ItemText,
 			TextItem: &TextItem{Text: chunk},
 		}})
@@ -1087,21 +1427,18 @@ func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) e
 
 // notifyError sends a short error notice to the user when NotifyErrors is enabled.
 // Errors are best-effort; failures to send the notice are logged but not returned.
-func (b *Bot) notifyError(ctx context.Context, userID, contextToken string, err error) {
+func (b *Bot) notifyError(ctx context.Context, sessionGeneration uint64, userID, contextToken string, err error) {
 	if !b.opts.NotifyErrors {
 		return
 	}
 	if requireContextToken(userID, contextToken) != nil {
 		return
 	}
-	if b.sessionGuard.AssertActive() != nil {
-		return
-	}
-	if b.getCreds() == nil {
+	if _, readyErr := b.readySession(sessionGeneration); readyErr != nil {
 		return
 	}
 	msg := "⚠️ 消息发送失败，请稍后重试。"
-	_, e := b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+	_, e := b.sendMessage(ctx, sessionGeneration, userID, contextToken, OutboundMessage{Item: MessageItem{
 		Type:     ItemText,
 		TextItem: &TextItem{Text: msg},
 	}})
@@ -1111,9 +1448,16 @@ func (b *Bot) notifyError(ctx context.Context, userID, contextToken string, err 
 }
 
 func (b *Bot) rememberContext(wire *WireMessage) error {
+	b.mu.Lock()
+	sessionGeneration := b.sessionGeneration
+	b.mu.Unlock()
+	return b.rememberContextForSession(sessionGeneration, wire)
+}
+
+func (b *Bot) rememberContextForSession(sessionGeneration uint64, wire *WireMessage) error {
 	userID := peerUserID(wire)
 	if userID != "" && wire.ContextToken != "" {
-		if err := b.contextTokens.Set(userID, wire.ContextToken); err != nil {
+		if err := b.persistContextToken(sessionGeneration, userID, wire.ContextToken); err != nil {
 			return fmt.Errorf("persist context token: %w", err)
 		}
 	}
@@ -1177,12 +1521,6 @@ func (b *Bot) parseMessage(wire *WireMessage) *IncomingMessage {
 	}
 
 	return msg
-}
-
-func (b *Bot) getCreds() *auth.Credentials {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.creds
 }
 
 func (b *Bot) configuredHandler() (MessageHandler, error) {

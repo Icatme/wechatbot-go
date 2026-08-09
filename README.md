@@ -73,7 +73,7 @@ func main() {
 - CDN 上传下载与 AES-128-ECB 解密
 - context_token 自动管理
 - 输入状态指示器
-- 会话过期（`-14`）自动恢复
+- 会话过期（`-14`）进入终止态，并由调用方显式重新认证
 
 Handler 返回 `RetryMessage(err)` 时，当前消息的重放键与所在批次游标不会提交，`Run` 会携带该错误退出；
 返回 `DropMessage(reason)` 会明确消费该消息。`Stop` 和传给 `Run` 的 context 会传播到 Handler，Handler 应及时响应取消。
@@ -82,6 +82,13 @@ Handler 返回 `RetryMessage(err)` 时，当前消息的重放键与所在批次
 同一个 Handler、Middleware 与 `AfterReceive` Hook 可能被不同用户并发调用，因此实现必须并发安全。全局轮询游标只会
 推进到连续完成的批次前缀；缺少 `message_id`、`client_id` 和 `seq` 的消息仍属于 at-least-once 投递。
 重放键按对端用户隔离，不同会话可安全复用相同的 `message_id`、`client_id` 或 `seq`。
+
+任一已认证接口返回 `ret: -14` 或 `errcode: -14` 时，SDK 会清除失效凭证、配置缓存与
+`context_token`，取消正在运行的轮询，并返回可由 `errors.Is(err, ErrReauthRequired)` 识别的错误。
+它不会自动弹出二维码或再次使用旧 token；应用确认交互时机后调用 `Reauthenticate(ctx)`。显式重认证也会先
+封锁当前健康会话，且旧 Run/Handler 不能使用新凭证发送或复活旧 `context_token`；已经明确 Ack/Drop 的
+投递仍按原语义提交。需要启动新认证流程的并发或回调内重入请求会返回
+`ErrLoginInProgress`；属于旧会话的后续操作返回 `ErrSessionChanged`，不表示当前会话仍需扫码。
 
 ## 文档
 

@@ -24,6 +24,8 @@
 
 - Preserved endpoint, HTTP status, `ret`, and `errcode` independently in the public API error type; wrapped errors and HTTP error envelopes now retain reliable `-14` classification.
 
+- Replaced the timed `-14` pause with a fail-closed reauthentication state: all authenticated API paths invalidate credentials/config/context once, cancel Run without auto-QR or token reuse, preserve cursor/replay state, recover only through explicit fresh QR reauthentication, and isolate stale auth/context work from the new session with generation checks plus a cancellable request gate.
+
 ## 2026-08-11
 
 - Closed reliable-delivery failure gaps: malformed wire messages now fail closed, replay identities are conversation-scoped and committed as one alias set, and credential/replay/cursor/context JSON state uses atomic replacement with disk-before-memory publication.

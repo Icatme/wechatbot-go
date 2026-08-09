@@ -173,20 +173,22 @@ const (
 
 // IncomingMessage is a parsed, user-friendly representation.
 type IncomingMessage struct {
-	UserID        string
-	Text          string
-	Type          ContentType
-	Timestamp     time.Time
-	Images        []ImageContent
-	Voices        []VoiceContent
-	Files         []FileContent
-	Videos        []VideoContent
-	QuotedMessage *QuotedMessage
-	SessionID     string
-	GroupID       string
-	RunID         string
-	Raw           *WireMessage
-	ContextToken  string // internal, managed by SDK
+	UserID            string
+	Text              string
+	Type              ContentType
+	Timestamp         time.Time
+	Images            []ImageContent
+	Voices            []VoiceContent
+	Files             []FileContent
+	Videos            []VideoContent
+	QuotedMessage     *QuotedMessage
+	SessionID         string
+	GroupID           string
+	RunID             string
+	Raw               *WireMessage
+	ContextToken      string // internal, managed by SDK
+	sessionGeneration uint64
+	sessionBound      bool
 }
 
 // ImageContent holds parsed image data from a message.

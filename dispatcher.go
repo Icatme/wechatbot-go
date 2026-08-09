@@ -101,7 +101,7 @@ func (d *keyedDispatcher) submit(batch updateBatch) error {
 			d.cancelUnscheduled(batchID, len(batch.messages)-i-1)
 			return err
 		}
-		if err := d.submitMessage(batchID, wire); err != nil {
+		if err := d.submitMessage(batchID, batch.sessionGeneration, wire); err != nil {
 			d.cancelUnscheduled(batchID, len(batch.messages)-i)
 			return err
 		}
@@ -109,7 +109,7 @@ func (d *keyedDispatcher) submit(batch updateBatch) error {
 	return nil
 }
 
-func (d *keyedDispatcher) submitMessage(batchID uint64, wire *WireMessage) error {
+func (d *keyedDispatcher) submitMessage(batchID, sessionGeneration uint64, wire *WireMessage) error {
 	select {
 	case d.pending <- struct{}{}:
 	case <-d.ctx.Done():
@@ -124,11 +124,11 @@ func (d *keyedDispatcher) submitMessage(batchID uint64, wire *WireMessage) error
 	d.wg.Add(1)
 	d.mu.Unlock()
 
-	go d.runMessage(batchID, key, previous, done, wire)
+	go d.runMessage(batchID, sessionGeneration, key, previous, done, wire)
 	return nil
 }
 
-func (d *keyedDispatcher) runMessage(batchID uint64, key string, previous, done chan struct{}, wire *WireMessage) {
+func (d *keyedDispatcher) runMessage(batchID, sessionGeneration uint64, key string, previous, done chan struct{}, wire *WireMessage) {
 	defer d.wg.Done()
 	defer func() {
 		close(done)
@@ -164,7 +164,7 @@ func (d *keyedDispatcher) runMessage(batchID uint64, key string, previous, done 
 		d.complete(batchID, err, false)
 		return
 	}
-	err := d.bot.processWireMessage(d.ctx, d.handler, wire)
+	err := d.bot.processWireMessage(d.ctx, d.handler, sessionGeneration, wire)
 	<-d.active
 	d.complete(batchID, err, true)
 }

@@ -4,6 +4,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,10 @@ type Credentials struct {
 	UserID    string `json:"userId"`
 	SavedAt   string `json:"savedAt,omitempty"`
 }
+
+// ErrInvalidatedCredential is returned when a login flow produces a token the
+// caller has already marked as invalid.
+var ErrInvalidatedCredential = errors.New("auth: login returned invalidated credentials")
 
 // DefaultCredPath returns ~/.wechatbot/credentials.json
 func DefaultCredPath() string {
@@ -60,14 +65,19 @@ func ClearCredentials(path string) error {
 	if path == "" {
 		path = DefaultCredPath()
 	}
-	return os.Remove(path)
+	err := os.Remove(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
 }
 
 // LoginOptions configures the login flow.
 type LoginOptions struct {
 	BaseURL      string
 	CredPath     string
-	Force        bool
+	Force        bool   // always runs QR login without loading or reusing stored credentials
+	InvalidToken string // reject any credentials containing this token
 	OnQRURL      func(url string)
 	OnScanned    func()
 	OnExpired    func()
@@ -89,9 +99,15 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 		baseURL = protocol.DefaultBaseURL
 	}
 
-	existing, _ := LoadCredentials(opts.CredPath)
-	if !opts.Force && existing != nil {
-		return existing, nil
+	var existing *Credentials
+	if !opts.Force {
+		existing, _ = LoadCredentials(opts.CredPath)
+		if existing != nil {
+			if err := rejectInvalidToken(existing.Token, opts.InvalidToken); err != nil {
+				return nil, err
+			}
+			return existing, nil
+		}
 	}
 
 	qrRefreshCount := 0
@@ -141,7 +157,7 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 				case "confirmed":
 					fmt.Fprintln(os.Stderr, "[wechatbot] Login confirmed")
 				case "binded_redirect":
-					fmt.Fprintln(os.Stderr, "[wechatbot] Already bound — using existing credentials")
+					fmt.Fprintln(os.Stderr, "[wechatbot] Account already bound")
 				}
 			}
 
@@ -149,16 +165,28 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 				if status.BotToken == "" || status.BotID == "" || status.UserID == "" {
 					return nil, fmt.Errorf("login confirmed but missing credentials")
 				}
+				if err := rejectInvalidToken(status.BotToken, opts.InvalidToken); err != nil {
+					return nil, err
+				}
 				return finalizeLogin(status, baseURL, opts.CredPath)
 			}
 
 			if status.Status == "binded_redirect" {
+				if opts.Force {
+					return nil, fmt.Errorf("account already bound; forced login cannot reuse existing credentials")
+				}
 				if existing != nil {
+					if err := rejectInvalidToken(existing.Token, opts.InvalidToken); err != nil {
+						return nil, err
+					}
 					return existing, nil
 				}
 				// Try loading from disk one more time.
 				creds, err := LoadCredentials(opts.CredPath)
 				if err == nil && creds != nil {
+					if err := rejectInvalidToken(creds.Token, opts.InvalidToken); err != nil {
+						return nil, err
+					}
 					return creds, nil
 				}
 				return nil, fmt.Errorf("account already bound but no local credentials found")
@@ -203,6 +231,13 @@ func Login(ctx context.Context, client *protocol.Client, opts LoginOptions) (*Cr
 	}
 }
 
+func rejectInvalidToken(token, invalidToken string) error {
+	if invalidToken != "" && token == invalidToken {
+		return ErrInvalidatedCredential
+	}
+	return nil
+}
+
 func localTokenList(existing *Credentials) []string {
 	if existing != nil && existing.Token != "" {
 		return []string{existing.Token}
@@ -223,7 +258,7 @@ func finalizeLogin(status *protocol.QRStatusResponse, baseURL, credPath string) 
 		SavedAt:   time.Now().UTC().Format(time.RFC3339),
 	}
 	if err := SaveCredentials(creds, credPath); err != nil {
-		fmt.Fprintf(os.Stderr, "[wechatbot] Warning: could not save credentials: %v\n", err)
+		return nil, fmt.Errorf("save credentials: %w", err)
 	}
 	return creds, nil
 }

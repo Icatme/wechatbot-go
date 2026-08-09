@@ -43,7 +43,7 @@ Timeout: 35s (server holds connection)
 → { ret: 0, msgs: [], get_updates_buf: "<new_cursor>" }
 ```
 
-Error: `errcode: -14` = session expired (re-login needed)
+Error: `ret: -14` or `errcode: -14` = session expired (explicit reauthentication needed)
 
 ## Send Message
 
