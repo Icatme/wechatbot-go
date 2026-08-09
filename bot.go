@@ -6,11 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,9 +29,6 @@ import (
 	"github.com/Icatme/wechatbot-go/internal/thumb"
 	botlog "github.com/Icatme/wechatbot-go/log"
 )
-
-// MessageHandler is called for each incoming user message.
-type MessageHandler func(msg *IncomingMessage)
 
 // Options configures a Bot instance.
 type Options struct {
@@ -59,12 +58,12 @@ type Bot struct {
 	creds         *auth.Credentials
 	configCache   *config.Cache
 	sessionGuard  *session.Guard
-	handlers      []MessageHandler
+	handler       MessageHandler
 	middlewares   []Middleware
 	contextTokens *store.ContextStore
 	cursorStore   *store.CursorStore
 	replayStore   *store.ReplayStore
-	stopped       bool
+	running       bool
 	mu            sync.Mutex
 	cancelPoll    context.CancelFunc
 	hooks         LifecycleHooks
@@ -171,14 +170,20 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 	return public, nil
 }
 
-// OnMessage registers a message handler.
-func (b *Bot) OnMessage(handler MessageHandler) {
-	b.handlers = append(b.handlers, handler)
+// Handle sets the single inbound message handler. Replacing the handler while
+// Run is active takes effect on the next Run.
+func (b *Bot) Handle(handler MessageHandler) {
+	b.mu.Lock()
+	b.handler = handler
+	b.mu.Unlock()
 }
 
-// Use adds a middleware to the incoming message pipeline.
+// Use adds a middleware to the incoming message pipeline. Middleware added
+// while Run is active takes effect on the next Run.
 func (b *Bot) Use(mw Middleware) {
+	b.mu.Lock()
 	b.middlewares = append(b.middlewares, mw)
+	b.mu.Unlock()
 }
 
 // Hooks returns the bot's lifecycle hook registry for extension.
@@ -437,19 +442,53 @@ type updateBatch struct {
 	cursor   string
 }
 
-// Run starts the long-poll loop. Blocks until Stop() is called or context is cancelled.
-func (b *Bot) Run(ctx context.Context) error {
-	creds := b.getCreds()
-	if creds == nil {
-		return fmt.Errorf("not logged in; call Login() first")
+func (b *Bot) beginRun(ctx context.Context) (*auth.Credentials, MessageHandler, context.Context, context.CancelFunc, error) {
+	b.mu.Lock()
+	if b.running {
+		b.mu.Unlock()
+		return nil, nil, nil, nil, ErrAlreadyRunning
+	}
+	if b.creds == nil {
+		b.mu.Unlock()
+		return nil, nil, nil, nil, fmt.Errorf("not logged in; call Login() first")
+	}
+	if b.handler == nil {
+		b.mu.Unlock()
+		return nil, nil, nil, nil, ErrNoMessageHandler
 	}
 
-	b.mu.Lock()
-	b.stopped = false
+	creds := b.creds
+	handler := b.handler
+	middlewares := append([]Middleware(nil), b.middlewares...)
 	pollCtx, cancel := context.WithCancel(ctx)
+	b.running = true
 	b.cancelPoll = cancel
 	b.mu.Unlock()
-	defer cancel()
+
+	handler, err := composeHandler(handler, middlewares)
+	if err != nil {
+		b.finishRun(cancel)
+		return nil, nil, nil, nil, err
+	}
+	return creds, handler, pollCtx, cancel, nil
+}
+
+func (b *Bot) finishRun(cancel context.CancelFunc) {
+	cancel()
+	b.mu.Lock()
+	b.running = false
+	b.cancelPoll = nil
+	b.mu.Unlock()
+}
+
+// Run starts the long-poll loop. It blocks until Stop is called, ctx is
+// cancelled, or a delivery requests retry. Only one Run may be active.
+func (b *Bot) Run(ctx context.Context) error {
+	creds, handler, pollCtx, cancel, err := b.beginRun(ctx)
+	if err != nil {
+		return err
+	}
+	defer b.finishRun(cancel)
 
 	b.log("info", "Long-poll loop started")
 	if loadErr := b.cursorStore.Load(); loadErr != nil {
@@ -486,7 +525,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	processorDone := make(chan struct{})
 	go func() {
 		defer close(processorDone)
-		if err := b.processUpdateBatches(pollCtx, batches); err != nil {
+		if err := b.processUpdateBatches(pollCtx, handler, batches); err != nil {
 			processorErrCh <- err
 			cancel()
 		}
@@ -505,6 +544,8 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 	}
 	stopResult := func() error {
+		cancel()
+		<-processorDone
 		if err := processorErr(); err != nil {
 			return err
 		}
@@ -588,14 +629,14 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 }
 
-func (b *Bot) processUpdateBatches(ctx context.Context, batches <-chan updateBatch) error {
+func (b *Bot) processUpdateBatches(ctx context.Context, handler MessageHandler, batches <-chan updateBatch) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case batch := <-batches:
-			if err := b.processUpdateBatch(ctx, batch); err != nil {
-				if ctx.Err() != nil {
+			if err := b.processUpdateBatch(ctx, handler, batch); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 					return nil
 				}
 				return err
@@ -604,12 +645,12 @@ func (b *Bot) processUpdateBatches(ctx context.Context, batches <-chan updateBat
 	}
 }
 
-func (b *Bot) processUpdateBatch(ctx context.Context, batch updateBatch) error {
+func (b *Bot) processUpdateBatch(ctx context.Context, handler MessageHandler, batch updateBatch) error {
 	for _, rawMsg := range batch.messages {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := b.processRawMessage(rawMsg); err != nil {
+		if err := b.processRawMessage(ctx, handler, rawMsg); err != nil {
 			return err
 		}
 	}
@@ -621,7 +662,7 @@ func (b *Bot) processUpdateBatch(ctx context.Context, batch updateBatch) error {
 	return nil
 }
 
-func (b *Bot) processRawMessage(rawMsg json.RawMessage) error {
+func (b *Bot) processRawMessage(ctx context.Context, handler MessageHandler, rawMsg json.RawMessage) error {
 	var wire WireMessage
 	if err := json.Unmarshal(rawMsg, &wire); err != nil {
 		return fmt.Errorf("decode incoming message: %w", err)
@@ -639,11 +680,14 @@ func (b *Bot) processRawMessage(rawMsg json.RawMessage) error {
 	incoming := b.parseMessage(&wire)
 	if incoming != nil {
 		if err := b.hooks.AfterReceive.Run(incoming); err != nil {
-			b.log("warn", "AfterReceive hook failed: %v", err)
-		} else if b.runMiddleware(incoming) {
-			for _, h := range b.handlers {
-				h(incoming)
-			}
+			return fmt.Errorf("AfterReceive hook failed: %w", err)
+		}
+		result := b.invokeHandler(ctx, handler, incoming)
+		if err := validateMessageResult(result); err != nil {
+			return fmt.Errorf("handle message: %w", err)
+		}
+		if result.Action == MessageDrop && result.Err != nil {
+			b.log("warn", "Message intentionally dropped: %v", result.Err)
 		}
 	}
 
@@ -694,10 +738,10 @@ func peerUserID(wire *WireMessage) string {
 // Stop gracefully stops the poll loop.
 func (b *Bot) Stop() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.stopped = true
-	if b.cancelPoll != nil {
-		b.cancelPoll()
+	cancel := b.cancelPoll
+	b.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -1133,13 +1177,44 @@ func (b *Bot) getCreds() *auth.Credentials {
 	return b.creds
 }
 
-func (b *Bot) runMiddleware(msg *IncomingMessage) bool {
-	for _, mw := range b.middlewares {
-		if mw != nil && !mw(msg) {
-			return false
+func (b *Bot) configuredHandler() (MessageHandler, error) {
+	b.mu.Lock()
+	handler := b.handler
+	middlewares := append([]Middleware(nil), b.middlewares...)
+	b.mu.Unlock()
+	return composeHandler(handler, middlewares)
+}
+
+func composeHandler(handler MessageHandler, middlewares []Middleware) (configured MessageHandler, err error) {
+	if handler == nil {
+		return nil, nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			configured = nil
+			err = fmt.Errorf("configure message middleware: %v", recovered)
+		}
+	}()
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		if middlewares[i] == nil {
+			continue
+		}
+		handler = middlewares[i](handler)
+		if handler == nil {
+			return nil, fmt.Errorf("configure message middleware %d: returned nil handler", i)
 		}
 	}
-	return true
+	return handler, nil
+}
+
+func (b *Bot) invokeHandler(ctx context.Context, handler MessageHandler, msg *IncomingMessage) (result MessageResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			b.log("error", "Message handler panic: %v\n%s", recovered, debug.Stack())
+			result = RetryMessage(fmt.Errorf("message handler panic: %v", recovered))
+		}
+	}()
+	return handler.HandleMessage(ctx, msg)
 }
 
 func (b *Bot) reportError(err error) {

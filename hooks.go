@@ -1,9 +1,5 @@
 package wechatbot
 
-// Middleware intercepts an incoming message and decides whether to pass it along.
-// Return false to stop processing the message (the message is dropped).
-type Middleware func(msg *IncomingMessage) bool
-
 // HookFunc is called at specific lifecycle points. Returning an error stops
 // further processing of that hook chain.
 type HookFunc[T any] func(payload T) error

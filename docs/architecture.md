@@ -6,7 +6,7 @@ All four SDKs (Node.js, Python, Go, Rust) follow the same layered architecture a
 
 ```mermaid
 graph TD
-    A["🤖 Application — Your Bot Code"] --> B["Middleware (Node.js only)"]
+    A["🤖 Application — Your Bot Code"] --> B["Middleware"]
     B --> C["Bot Client — Orchestrator: login, run, reply"]
     C --> D["Poller"]
     C --> E["Sender"]
@@ -27,7 +27,7 @@ graph TD
 |---|---|---|---|---|
 | Package | `@wechatbot/wechatbot` | `wechatbot-sdk` (PyPI) | `github.com/corespeed-io/wechatbot/golang` | `wechatbot` (crates.io) |
 | Async model | `async/await` (Promises) | `async/await` (asyncio) | goroutines + `context.Context` | `async/await` (tokio) |
-| Middleware | ✓ Express-style pipeline | — (use decorator composition) | — (use handler composition) | — (use closures) |
+| Middleware | ✓ Express-style pipeline | — (use decorator composition) | ✓ handler composition | — (use closures) |
 | Storage | Pluggable (file/memory/custom) | File-based | File-based | File-based |
 | Media crypto | ✓ AES-128-ECB | ✓ AES-128-ECB | ✓ AES-128-ECB | ✓ AES-128-ECB |
 | Events | Typed EventEmitter | Callbacks (on_qr_url, on_error…) | Callbacks (OnError, OnQRURL) | Callbacks |
@@ -59,9 +59,10 @@ All SDKs implement the same flow:
 
 1. `POST /getupdates` with cursor (35s server hold)
 2. Parse messages, cache context_tokens
-3. Dispatch to handlers
-4. On `-14` error → clear state, re-login
-5. On network error → exponential backoff (1s → 10s max)
+3. Dispatch to the configured handler through middleware
+4. Commit replay identity and cursor only after an explicit Ack or Drop result
+5. On `-14` error → clear state, re-login
+6. On network error → exponential backoff (1s → 10s max)
 
 ### Media Pipeline
 
