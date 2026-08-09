@@ -32,6 +32,9 @@ const (
 	ItemVoice MessageItemType = 3
 	ItemFile  MessageItemType = 4
 	ItemVideo MessageItemType = 5
+
+	ItemToolCallStart  MessageItemType = 11
+	ItemToolCallResult MessageItemType = 12
 )
 
 // MediaType is used in upload requests.
@@ -106,15 +109,34 @@ type RefMessage struct {
 	MessageItem *MessageItem `json:"message_item,omitempty"`
 }
 
+// ToolCallStartItem identifies a tool invocation that has started.
+type ToolCallStartItem struct {
+	ToolName   string `json:"tool_name,omitempty"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+}
+
+// ToolCallResultItem identifies the terminal state of a tool invocation.
+type ToolCallResultItem struct {
+	ToolName   string `json:"tool_name,omitempty"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	Status     string `json:"status,omitempty"`
+}
+
 // MessageItem is a single content item within a message.
 type MessageItem struct {
-	Type      MessageItemType `json:"type"`
-	TextItem  *TextItem       `json:"text_item,omitempty"`
-	ImageItem *ImageItem      `json:"image_item,omitempty"`
-	VoiceItem *VoiceItem      `json:"voice_item,omitempty"`
-	FileItem  *FileItem       `json:"file_item,omitempty"`
-	VideoItem *VideoItem      `json:"video_item,omitempty"`
-	RefMsg    *RefMessage     `json:"ref_msg,omitempty"`
+	Type               MessageItemType     `json:"type"`
+	CreateTimeMs       int64               `json:"create_time_ms,omitempty"`
+	UpdateTimeMs       int64               `json:"update_time_ms,omitempty"`
+	IsCompleted        *bool               `json:"is_completed,omitempty"`
+	MsgID              string              `json:"msg_id,omitempty"`
+	TextItem           *TextItem           `json:"text_item,omitempty"`
+	ImageItem          *ImageItem          `json:"image_item,omitempty"`
+	VoiceItem          *VoiceItem          `json:"voice_item,omitempty"`
+	FileItem           *FileItem           `json:"file_item,omitempty"`
+	VideoItem          *VideoItem          `json:"video_item,omitempty"`
+	ToolCallStartItem  *ToolCallStartItem  `json:"tool_call_start_item,omitempty"`
+	ToolCallResultItem *ToolCallResultItem `json:"tool_call_result_item,omitempty"`
+	RefMsg             *RefMessage         `json:"ref_msg,omitempty"`
 }
 
 // WireMessage is the raw message from the iLink API.
@@ -125,9 +147,14 @@ type WireMessage struct {
 	ToUserID     string        `json:"to_user_id"`
 	ClientID     string        `json:"client_id"`
 	CreateTimeMs int64         `json:"create_time_ms"`
+	UpdateTimeMs int64         `json:"update_time_ms,omitempty"`
+	DeleteTimeMs int64         `json:"delete_time_ms,omitempty"`
+	SessionID    string        `json:"session_id,omitempty"`
+	GroupID      string        `json:"group_id,omitempty"`
 	MessageType  MessageType   `json:"message_type"`
 	MessageState MessageState  `json:"message_state"`
 	ContextToken string        `json:"context_token"`
+	RunID        string        `json:"run_id,omitempty"`
 	ItemList     []MessageItem `json:"item_list"`
 }
 
@@ -135,11 +162,13 @@ type WireMessage struct {
 type ContentType string
 
 const (
-	ContentText  ContentType = "text"
-	ContentImage ContentType = "image"
-	ContentVoice ContentType = "voice"
-	ContentFile  ContentType = "file"
-	ContentVideo ContentType = "video"
+	ContentText           ContentType = "text"
+	ContentImage          ContentType = "image"
+	ContentVoice          ContentType = "voice"
+	ContentFile           ContentType = "file"
+	ContentVideo          ContentType = "video"
+	ContentToolCallStart  ContentType = "tool_call_start"
+	ContentToolCallResult ContentType = "tool_call_result"
 )
 
 // IncomingMessage is a parsed, user-friendly representation.
@@ -153,6 +182,9 @@ type IncomingMessage struct {
 	Files         []FileContent
 	Videos        []VideoContent
 	QuotedMessage *QuotedMessage
+	SessionID     string
+	GroupID       string
+	RunID         string
 	Raw           *WireMessage
 	ContextToken  string // internal, managed by SDK
 }

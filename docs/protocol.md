@@ -101,6 +101,11 @@ GET <cdn>/download?encrypted_query_param=<param>
 | VOICE | 3 | Voice with optional transcription |
 | FILE | 4 | File attachment |
 | VIDEO | 5 | Video with optional thumbnail |
+| TOOL_CALL_START | 11 | Tool invocation started (`tool_name`, `tool_call_id`) |
+| TOOL_CALL_RESULT | 12 | Tool invocation completed with status |
+
+Message items may also carry `create_time_ms`, `update_time_ms`, `is_completed`, and `msg_id`.
+Messages may carry `session_id`, `group_id`, and `run_id` for Agent correlation.
 
 ## AES Key Formats
 
