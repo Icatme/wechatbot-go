@@ -624,13 +624,14 @@ func (b *Bot) processUpdateBatch(ctx context.Context, batch updateBatch) error {
 func (b *Bot) processRawMessage(rawMsg json.RawMessage) error {
 	var wire WireMessage
 	if err := json.Unmarshal(rawMsg, &wire); err != nil {
-		b.log("warn", "Failed to decode incoming message: %v", err)
-		return nil
+		return fmt.Errorf("decode incoming message: %w", err)
 	}
 
-	key := replayKey(&wire)
-	if key != "" && b.replayStore.Seen(key) {
-		b.log("debug", "Skipping replayed message %s", key)
+	keys := replayKeys(&wire)
+	// replayKeys orders aliases strongest-first. A weaker alias may collide on a
+	// distinct delivery, so only the strongest identity present may suppress it.
+	if len(keys) > 0 && b.replayStore.SeenAny(keys[0]) {
+		b.log("debug", "Skipping replayed message with identity %s", keys[0])
 		return nil
 	}
 
@@ -646,23 +647,46 @@ func (b *Bot) processRawMessage(rawMsg json.RawMessage) error {
 		}
 	}
 
-	if key != "" {
-		if err := b.replayStore.Commit(key); err != nil {
-			return fmt.Errorf("commit replay key %s: %w", key, err)
+	if len(keys) > 0 {
+		if err := b.replayStore.CommitAll(keys...); err != nil {
+			return fmt.Errorf("commit replay identities %v: %w", keys, err)
 		}
 	}
 	return nil
 }
 
-func replayKey(wire *WireMessage) string {
+func replayKeys(wire *WireMessage) []string {
+	peer := peerUserID(wire)
+	if peer == "" {
+		return nil
+	}
+
+	prefix := "peer:" + strconv.Itoa(len(peer)) + ":" + peer + ":"
+	keys := make([]string, 0, 3)
 	if wire.MessageID != 0 {
-		return "message:" + strconv.FormatInt(wire.MessageID, 10)
+		keys = append(keys, prefix+"message:"+strconv.FormatInt(wire.MessageID, 10))
 	}
 	if wire.ClientID != "" {
-		return "client:" + wire.ClientID
+		keys = append(keys, prefix+"client:"+wire.ClientID)
 	}
 	if wire.Seq != 0 {
-		return "seq:" + strconv.FormatInt(wire.Seq, 10)
+		keys = append(keys, prefix+"seq:"+strconv.FormatInt(wire.Seq, 10))
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return keys
+}
+
+func peerUserID(wire *WireMessage) string {
+	if wire == nil {
+		return ""
+	}
+	if wire.MessageType == MessageTypeBot {
+		return wire.ToUserID
+	}
+	if wire.MessageType == MessageTypeUser {
+		return wire.FromUserID
 	}
 	return ""
 }
