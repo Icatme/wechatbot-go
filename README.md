@@ -1,12 +1,12 @@
 # wechatbot-go
 
-一个专注 Go 语言的微信 iLink Bot SDK，从多语言仓库中独立出来单独维护。
+wechatbot-go 是微信 iLink Bot API 的 Go SDK。
 
-本项目基于 [corespeed-io/wechatbot](https://github.com/corespeed-io/wechatbot) 的 Go SDK 部分，但已拆分
-为独立的 Go-only 仓库并持续演进。原仓库同时维护 Node.js、Python、Rust 等版本，而这里只保留和
-改进 Go 实现：更完整的协议对齐、状态持久化、登录流程增强以及可扩展的消息处理钩子。
+代码最初来源于 [corespeed-io/wechatbot](https://github.com/corespeed-io/wechatbot) 的 Go SDK 部分，
+协议行为也参考 [Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin)。当前仓库作为
+独立 Go module 维护，不与上述仓库自动同步。
 
-如果你需要一个纯 Go、长期维护、面向实际运行场景的微信 Bot SDK，本仓库会更合适。
+项目范围包括登录、消息收发、媒体传输、投递状态和会话状态管理，不包含 Agent 推理或编排运行时。
 
 ---
 
@@ -18,6 +18,25 @@ go get github.com/Icatme/wechatbot-go
 
 要求 Go 1.25+，零 CGO 依赖。
 
+## 最近更新（v0.4.0）
+
+`v0.4.0` 主要调整投递与会话语义：
+
+- 增加持久化 replay 去重、原子 cursor/context/replay 状态以及 malformed message fail-closed。
+- Handler 改为接收 `context.Context`，并通过 Ack / Retry / Drop 明确返回投递结果。
+- 同一对端用户串行处理，不同用户在有界并发下处理；cursor 只推进到连续完成的批次前缀。
+- 增加 Agent `run_id` / `session_id` / `group_id`、工具调用项类型 11/12，以及稳定的出站 `client_id`。
+- API 错误可通过 `errors.As` 获取 HTTP status、`ret` 和 `errcode`。
+- 会话过期后不再自动复用旧 token；调用方显式调用 `Reauthenticate(ctx)`，持久化 marker 保证进程重启后仍保持 fail-closed。
+
+从 `v0.3.x` 迁移时需要注意：
+
+- `Bot.OnMessage(func(*IncomingMessage))` 改为 `Bot.Handle(MessageHandler)`；Handler 需要返回 `MessageResult`。
+- `LifecycleHooks.BeforeSend` 的 payload 从 `*SendContent` 改为 `*SendRequest`，并增加 `AfterSend`。
+- 收到 `ErrReauthRequired` 后，由应用决定何时发起二维码交互并调用 `Reauthenticate(ctx)`。
+
+完整说明见 [v0.4.0 Release](https://github.com/Icatme/wechatbot-go/releases/tag/v0.4.0)。
+
 ## 快速开始
 
 ```go
@@ -25,6 +44,7 @@ package main
 
 import (
     "context"
+    "errors"
     "fmt"
     "os"
     "os/signal"
@@ -53,13 +73,15 @@ func main() {
         return wechatbot.AckMessage()
     }))
 
-    _ = bot.Run(ctx)
+    if err := bot.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+        fmt.Fprintln(os.Stderr, "运行结束:", err)
+    }
 }
 ```
 
 更多示例见 [`examples/`](examples/)。
 
-## 功能特性
+## 功能范围
 
 - 扫码登录 + 凭证持久化
 - 长轮询接收消息
@@ -96,18 +118,18 @@ Handler 返回 `RetryMessage(err)` 时，当前消息的重放键与所在批次
 ## 文档
 
 - [API 协议参考](docs/protocol.md)
-- [架构与 SDK 对比](docs/architecture.md)（来自原仓库，Go 部分仍适用）
+- [架构说明](docs/architecture.md)
 
-## 与原仓库的关系
+## 来源与同步范围
 
-- 原仓库：`github.com/corespeed-io/wechatbot`（多语言 SDK 集合）
-- 本仓库：`github.com/Icatme/wechatbot-go`（独立维护的 Go-only 分支）
-- 协议与核心实现源自原仓库的 Go 部分，但已不再同步合并
+- 初始 Go 实现来源：`github.com/corespeed-io/wechatbot`
+- 协议参考：`github.com/Tencent/openclaw-weixin`
+- 本仓库独立维护，变更不会自动与上述仓库双向同步
 - 许可证：MIT（保留原项目版权声明）
 
 ## 贡献
 
-由于这是独立维护的 Go-only fork，Issues 和 PR 请提交到本仓库。
+本仓库相关的 Issues 和 PR 可直接提交到当前仓库。
 
 ## License
 
