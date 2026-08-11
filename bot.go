@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -586,8 +587,8 @@ func (b *Bot) Run(ctx context.Context) error {
 				return stopResult()
 			}
 
-			apiErr, isAPI := err.(*protocol.APIError)
-			if isAPI && apiErr.IsSessionExpired() {
+			var apiErr *protocol.APIError
+			if errors.As(err, &apiErr) && apiErr.IsSessionExpired() {
 				b.log("warn", "Session expired — pausing for %v", session.PauseDuration)
 				b.sessionGuard.Pause()
 				retryDelay = time.Second

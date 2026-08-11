@@ -22,6 +22,8 @@
 
 - Added a one-item outbound contract with caller-stable/generated `client_id`, failure-safe `SendResult`, per-message `run_id`, tool-call progress builders, and wire-level BeforeSend/AfterSend hooks across text and media sends.
 
+- Preserved endpoint, HTTP status, `ret`, and `errcode` independently in the public API error type; wrapped errors and HTTP error envelopes now retain reliable `-14` classification.
+
 ## 2026-08-11
 
 - Closed reliable-delivery failure gaps: malformed wire messages now fail closed, replay identities are conversation-scoped and committed as one alias set, and credential/replay/cursor/context JSON state uses atomic replacement with disk-before-memory publication.
