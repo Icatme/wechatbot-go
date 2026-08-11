@@ -3,9 +3,11 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -121,5 +123,36 @@ func TestContextStoreMissingFile(t *testing.T) {
 	s := NewContextStore("", filepath.Join(dir, "not-exist.json"))
 	if err := s.Load(); err != nil {
 		t.Fatalf("missing file should not error: %v", err)
+	}
+}
+
+func TestContextStoreConcurrentSetPersistsAllTokens(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "context_tokens.json")
+	store := NewContextStore("", path)
+	const total = 64
+	var wg sync.WaitGroup
+	errs := make(chan error, total)
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs <- store.Set(fmt.Sprintf("user-%d", i), fmt.Sprintf("token-%d", i))
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Set: %v", err)
+		}
+	}
+
+	reloaded := NewContextStore("", path)
+	if err := reloaded.Load(); err != nil {
+		t.Fatalf("load persisted tokens: %v", err)
+	}
+	if got := len(reloaded.All()); got != total {
+		t.Fatalf("persisted tokens = %d, want %d", got, total)
 	}
 }

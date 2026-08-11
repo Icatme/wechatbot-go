@@ -286,28 +286,32 @@ func TestParseMessageWithQuoted(t *testing.T) {
 }
 
 func TestRememberContextUser(t *testing.T) {
-	b := New()
+	b := New(Options{ContextTokenPath: filepath.Join(t.TempDir(), "context_tokens.json")})
 	wire := &WireMessage{
 		FromUserID:   "user123",
 		ToUserID:     "bot456",
 		MessageType:  MessageTypeUser,
 		ContextToken: "ctx-new",
 	}
-	b.rememberContext(wire)
+	if err := b.rememberContext(wire); err != nil {
+		t.Fatalf("remember context: %v", err)
+	}
 	if ct := b.contextTokens.Get("user123"); ct != "ctx-new" {
 		t.Fatalf("expected context token ctx-new, got %v", ct)
 	}
 }
 
 func TestRememberContextBot(t *testing.T) {
-	b := New()
+	b := New(Options{ContextTokenPath: filepath.Join(t.TempDir(), "context_tokens.json")})
 	wire := &WireMessage{
 		FromUserID:   "bot456",
 		ToUserID:     "user123",
 		MessageType:  MessageTypeBot,
 		ContextToken: "ctx-bot",
 	}
-	b.rememberContext(wire)
+	if err := b.rememberContext(wire); err != nil {
+		t.Fatalf("remember context: %v", err)
+	}
 	if ct := b.contextTokens.Get("user123"); ct != "ctx-bot" {
 		t.Fatalf("expected context token ctx-bot for toUserID, got %v", ct)
 	}
@@ -798,7 +802,9 @@ func TestProcessUpdateBatchPrefersMessageIDOverCollidingFallbackAliases(t *testi
 		},
 	}
 	for i, wire := range messages {
-		if err := bot.processRawMessage(context.Background(), handler, marshalWireMessage(t, wire)); err != nil {
+		if err := bot.processUpdateBatch(context.Background(), handler, updateBatch{
+			messages: []json.RawMessage{marshalWireMessage(t, wire)},
+		}); err != nil {
 			t.Fatalf("delivery %d failed: %v", i+1, err)
 		}
 	}
@@ -835,7 +841,9 @@ func TestProcessUpdateBatchKeepsAtLeastOnceWithoutIdentityOrPeer(t *testing.T) {
 			t.Fatalf("replayKeys(%+v) = %q, want no keys", wire, keys)
 		}
 		for delivery := 0; delivery < 2; delivery++ {
-			if err := bot.processRawMessage(context.Background(), handler, marshalWireMessage(t, wire)); err != nil {
+			if err := bot.processUpdateBatch(context.Background(), handler, updateBatch{
+				messages: []json.RawMessage{marshalWireMessage(t, wire)},
+			}); err != nil {
 				t.Fatalf("process message: %v", err)
 			}
 		}

@@ -1,11 +1,14 @@
 package wechatbot
 
+import "sync"
+
 // HookFunc is called at specific lifecycle points. Returning an error stops
 // further processing of that hook chain.
 type HookFunc[T any] func(payload T) error
 
 // HookRegistry manages named hooks for bot lifecycle events.
 type HookRegistry[T any] struct {
+	mu    sync.RWMutex
 	hooks []HookFunc[T]
 }
 
@@ -14,6 +17,8 @@ func (r *HookRegistry[T]) Register(hook HookFunc[T]) {
 	if r == nil {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.hooks = append(r.hooks, hook)
 }
 
@@ -22,7 +27,10 @@ func (r *HookRegistry[T]) Run(payload T) error {
 	if r == nil {
 		return nil
 	}
-	for _, h := range r.hooks {
+	r.mu.RLock()
+	hooks := append([]HookFunc[T](nil), r.hooks...)
+	r.mu.RUnlock()
+	for _, h := range hooks {
 		if h == nil {
 			continue
 		}

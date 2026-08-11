@@ -8,7 +8,7 @@ All four SDKs (Node.js, Python, Go, Rust) follow the same layered architecture a
 graph TD
     A["🤖 Application — Your Bot Code"] --> B["Middleware"]
     B --> C["Bot Client — Orchestrator: login, run, reply"]
-    C --> D["Poller"]
+    C --> D["Poller + bounded keyed dispatcher"]
     C --> E["Sender"]
     C --> F["Typing"]
     C --> G["Media"]
@@ -58,11 +58,12 @@ All SDKs implement the same flow:
 ### Long-Poll Loop
 
 1. `POST /getupdates` with cursor (35s server hold)
-2. Parse messages, cache context_tokens
-3. Dispatch to the configured handler through middleware
-4. Commit replay identity and cursor only after an explicit Ack or Drop result
-5. On `-14` error → clear state, re-login
-6. On network error → exponential backoff (1s → 10s max)
+2. Decode each batch into bounded keyed work
+3. Serialize each user's token persistence and delivery while handling unrelated users concurrently
+4. Run `AfterReceive`, middleware, and the configured handler
+5. Commit each replay identity after Ack/Drop, then advance the global cursor only through the contiguous completed-batch prefix
+6. On `-14` error → clear state, re-login
+7. On network error → exponential backoff (1s → 10s max)
 
 ### Media Pipeline
 

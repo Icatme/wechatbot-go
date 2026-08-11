@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -206,6 +208,34 @@ func TestRunRequiresHandlerBeforeNetwork(t *testing.T) {
 	}
 }
 
+func TestRunFailsClosedOnInvalidCursorState(t *testing.T) {
+	dir := t.TempDir()
+	cursorPath := filepath.Join(dir, "cursor.json")
+	if err := os.WriteFile(cursorPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bot := New(Options{
+		ContextTokenPath: filepath.Join(dir, "context_tokens.json"),
+		CursorPath:       cursorPath,
+		ReplayPath:       filepath.Join(dir, "replay_dedupe.json"),
+	})
+	bot.creds = &auth.Credentials{BaseURL: "https://example.com", Token: "token"}
+	bot.Handle(MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult {
+		return AckMessage()
+	}))
+
+	err := bot.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "load cursor state") {
+		t.Fatalf("Run() error = %v, want cursor state failure", err)
+	}
+	bot.mu.Lock()
+	running := bot.running
+	bot.mu.Unlock()
+	if running {
+		t.Fatal("bot remained running after cursor load failed")
+	}
+}
+
 func TestBeginRunRejectsConcurrentRunAndResetsState(t *testing.T) {
 	bot := New()
 	bot.creds = &auth.Credentials{BaseURL: "https://example.com", Token: "token"}
@@ -261,48 +291,72 @@ func TestStopCancelsHandlerContext(t *testing.T) {
 	}
 }
 
-func TestRunPreservesRetryErrorWhenHandlerStopsBot(t *testing.T) {
-	bot := newHandlerTestBot(t)
+func TestRunPreservesHandlerOutcomeWhenHandlerStopsBot(t *testing.T) {
 	retryErr := errors.New("retry after stop")
-	raw := handlerTestBatch(t, 105, "cursor-stop-retry").messages[0]
-	var polls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
-			_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
-		case "/ilink/bot/getupdates":
-			if polls.Add(1) == 1 {
-				_ = json.NewEncoder(w).Encode(map[string]interface{}{
-					"ret":             0,
-					"msgs":            []json.RawMessage{raw},
-					"get_updates_buf": "cursor-stop-retry",
-				})
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-	bot.client.HTTP = server.Client()
-	bot.creds = &auth.Credentials{BaseURL: server.URL, Token: "token", AccountID: "bot-1"}
-	bot.Handle(MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult {
-		bot.Stop()
-		return RetryMessage(retryErr)
-	}))
+	tests := []struct {
+		name      string
+		result    func(context.Context) MessageResult
+		wantErr   error
+		committed bool
+	}{
+		{name: "ack", result: func(context.Context) MessageResult { return AckMessage() }, committed: true},
+		{name: "retry", result: func(context.Context) MessageResult { return RetryMessage(retryErr) }, wantErr: retryErr},
+		{name: "retry cancellation", result: func(ctx context.Context) MessageResult { return RetryMessage(ctx.Err()) }, wantErr: context.Canceled},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bot := newHandlerTestBot(t)
+			messageID := int64(105 + i)
+			cursor := fmt.Sprintf("cursor-stop-%d", i)
+			raw := handlerTestBatch(t, messageID, cursor).messages[0]
+			var polls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
+					_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+				case "/ilink/bot/getupdates":
+					if polls.Add(1) == 1 {
+						_ = json.NewEncoder(w).Encode(map[string]interface{}{
+							"ret":             0,
+							"msgs":            []json.RawMessage{raw},
+							"get_updates_buf": cursor,
+						})
+						return
+					}
+					_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+			bot.client.HTTP = server.Client()
+			bot.creds = &auth.Credentials{BaseURL: server.URL, Token: "token", AccountID: "bot-1"}
+			bot.Handle(MessageHandlerFunc(func(ctx context.Context, _ *IncomingMessage) MessageResult {
+				bot.Stop()
+				return tc.result(ctx)
+			}))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	err := bot.Run(ctx)
-	if !errors.Is(err, retryErr) {
-		t.Fatalf("Run() error = %v, want %v", err, retryErr)
-	}
-	if got := bot.cursorStore.Get(); got != "" {
-		t.Fatalf("cursor = %q, want uncommitted", got)
-	}
-	if bot.replayStore.Seen(handlerReplayKey(105)) {
-		t.Fatal("retry after Stop was committed to replay store")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			err := bot.Run(ctx)
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("Run() error = %v", err)
+				}
+			} else if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("Run() error = %v, want %v", err, tc.wantErr)
+			}
+			if got := bot.replayStore.Seen(handlerReplayKey(messageID)); got != tc.committed {
+				t.Fatalf("replay committed = %v, want %v", got, tc.committed)
+			}
+			wantCursor := ""
+			if tc.committed {
+				wantCursor = cursor
+			}
+			if got := bot.cursorStore.Get(); got != wantCursor {
+				t.Fatalf("cursor = %q, want %q", got, wantCursor)
+			}
+		})
 	}
 }
 
