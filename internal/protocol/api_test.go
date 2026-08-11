@@ -54,3 +54,15 @@ func TestGetUpdatesDecodeError(t *testing.T) {
 		t.Fatalf("expected decode response error, got %v", err)
 	}
 }
+
+func TestSendMessageEmptyResponseReturnsError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	err := NewClient().SendMessage(context.Background(), ts.URL, "tok", map[string]interface{}{})
+	if err == nil || !strings.Contains(err.Error(), "decode response") {
+		t.Fatalf("expected decode response error, got %v", err)
+	}
+}

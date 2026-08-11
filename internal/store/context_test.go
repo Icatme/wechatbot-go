@@ -1,8 +1,11 @@
 package store
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -48,8 +51,59 @@ func TestContextStoreClear(t *testing.T) {
 	if len(s.All()) != 0 {
 		t.Fatal("expected empty after clear")
 	}
-	if _, err := os.Stat(s.Path()); !os.IsNotExist(err) {
-		t.Fatal("expected file removed after clear")
+	data, err := os.ReadFile(s.Path())
+	if err != nil {
+		t.Fatalf("read cleared contexts: %v", err)
+	}
+	var persisted map[string]string
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatalf("decode cleared contexts: %v", err)
+	}
+	if len(persisted) != 0 {
+		t.Fatalf("persisted contexts after clear = %v, want empty", persisted)
+	}
+}
+
+func TestContextStoreMutationFailureKeepsMemoryAndDisk(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*ContextStore) error
+	}{
+		{name: "set", mutate: func(s *ContextStore) error { return s.Set("user1", "new") }},
+		{name: "delete", mutate: func(s *ContextStore) error { return s.Delete("user1") }},
+		{name: "clear", mutate: func(s *ContextStore) error { return s.Clear() }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "context_tokens.json")
+			s := NewContextStore("", path)
+			if err := s.Set("user1", "old"); err != nil {
+				t.Fatalf("set old token: %v", err)
+			}
+			if err := s.Set("user2", "keep"); err != nil {
+				t.Fatalf("set second token: %v", err)
+			}
+			oldMemory := s.All()
+			oldDisk, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read old contexts: %v", err)
+			}
+			s.write = func(string, any) error { return errors.New("injected write failure") }
+
+			if err := tt.mutate(s); err == nil {
+				t.Fatal("expected mutation failure")
+			}
+			if got := s.All(); !reflect.DeepEqual(got, oldMemory) {
+				t.Fatalf("context memory = %v, want %v", got, oldMemory)
+			}
+			newDisk, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read contexts after failure: %v", err)
+			}
+			if string(newDisk) != string(oldDisk) {
+				t.Fatalf("context disk changed after failure: %q", newDisk)
+			}
+		})
 	}
 }
 

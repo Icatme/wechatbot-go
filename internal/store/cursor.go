@@ -6,13 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/Icatme/wechatbot-go/internal/persist"
 )
 
 // CursorStore persists the get_updates_buf cursor so the bot can resume polling after a restart.
 type CursorStore struct {
-	path string
-	mu   sync.RWMutex
-	buf  string
+	path  string
+	write func(string, any) error
+	mu    sync.RWMutex
+	buf   string
 }
 
 // CursorData is the on-disk format for future extensibility.
@@ -27,7 +30,7 @@ func NewCursorStore(accountID, path string) *CursorStore {
 	if path == "" {
 		path = filepath.Join(AccountStateDir(accountID), "cursor.json")
 	}
-	return &CursorStore{path: path}
+	return &CursorStore{path: path, write: persist.WriteJSONAtomic}
 }
 
 // Path returns the backing file path.
@@ -65,19 +68,8 @@ func (s *CursorStore) Load() error {
 // Save persists the current cursor to disk.
 func (s *CursorStore) Save() error {
 	s.mu.RLock()
-	buf := s.buf
-	s.mu.RUnlock()
-
-	if err := ensureDir(filepath.Dir(s.path)); err != nil {
-		return fmt.Errorf("ensure state dir: %w", err)
-	}
-
-	out, err := json.MarshalIndent(CursorData{GetUpdatesBuf: buf}, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode cursor: %w", err)
-	}
-
-	if err := os.WriteFile(s.path, append(out, '\n'), 0600); err != nil {
+	defer s.mu.RUnlock()
+	if err := s.write(s.path, CursorData{GetUpdatesBuf: s.buf}); err != nil {
 		return fmt.Errorf("write cursor: %w", err)
 	}
 	return nil
@@ -93,19 +85,15 @@ func (s *CursorStore) Get() string {
 // Set updates the cursor and persists it.
 func (s *CursorStore) Set(buf string) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.write(s.path, CursorData{GetUpdatesBuf: buf}); err != nil {
+		return fmt.Errorf("write cursor: %w", err)
+	}
 	s.buf = buf
-	s.mu.Unlock()
-	return s.Save()
+	return nil
 }
 
-// Clear removes the persisted cursor.
+// Clear persists an empty cursor.
 func (s *CursorStore) Clear() error {
-	s.mu.Lock()
-	s.buf = ""
-	s.mu.Unlock()
-	if err := s.Save(); err != nil {
-		return err
-	}
-	_ = os.Remove(s.path)
-	return nil
+	return s.Set("")
 }

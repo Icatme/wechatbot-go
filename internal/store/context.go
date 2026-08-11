@@ -6,14 +6,17 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/Icatme/wechatbot-go/internal/persist"
 )
 
 // ContextStore persists context tokens per user.
 // Tokens are needed to reply in the correct conversation and must survive restarts.
 type ContextStore struct {
-	path string
-	mu   sync.RWMutex
-	data map[string]string
+	path  string
+	write func(string, any) error
+	mu    sync.RWMutex
+	data  map[string]string
 }
 
 // NewContextStore creates a store backed by the given file path.
@@ -24,8 +27,9 @@ func NewContextStore(accountID, path string) *ContextStore {
 		path = filepath.Join(AccountStateDir(accountID), "context_tokens.json")
 	}
 	return &ContextStore{
-		path: path,
-		data: make(map[string]string),
+		path:  path,
+		write: persist.WriteJSONAtomic,
+		data:  make(map[string]string),
 	}
 }
 
@@ -62,22 +66,8 @@ func (s *ContextStore) Load() error {
 // Save writes the current in-memory tokens to disk.
 func (s *ContextStore) Save() error {
 	s.mu.RLock()
-	data := make(map[string]string, len(s.data))
-	for k, v := range s.data {
-		data[k] = v
-	}
-	s.mu.RUnlock()
-
-	if err := ensureDir(filepath.Dir(s.path)); err != nil {
-		return fmt.Errorf("ensure state dir: %w", err)
-	}
-
-	out, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode context tokens: %w", err)
-	}
-
-	if err := os.WriteFile(s.path, append(out, '\n'), 0600); err != nil {
+	defer s.mu.RUnlock()
+	if err := s.write(s.path, s.data); err != nil {
 		return fmt.Errorf("write context tokens: %w", err)
 	}
 	return nil
@@ -96,17 +86,27 @@ func (s *ContextStore) Set(userID, token string) error {
 		return nil
 	}
 	s.mu.Lock()
-	s.data[userID] = token
-	s.mu.Unlock()
-	return s.Save()
+	defer s.mu.Unlock()
+	next := cloneContext(s.data)
+	next[userID] = token
+	if err := s.write(s.path, next); err != nil {
+		return fmt.Errorf("write context tokens: %w", err)
+	}
+	s.data = next
+	return nil
 }
 
 // Delete removes a user's context token.
 func (s *ContextStore) Delete(userID string) error {
 	s.mu.Lock()
-	delete(s.data, userID)
-	s.mu.Unlock()
-	return s.Save()
+	defer s.mu.Unlock()
+	next := cloneContext(s.data)
+	delete(next, userID)
+	if err := s.write(s.path, next); err != nil {
+		return fmt.Errorf("write context tokens: %w", err)
+	}
+	s.data = next
+	return nil
 }
 
 // All returns a copy of all stored tokens.
@@ -120,14 +120,22 @@ func (s *ContextStore) All() map[string]string {
 	return out
 }
 
-// Clear removes all tokens from memory and disk.
+// Clear persists an empty token set.
 func (s *ContextStore) Clear() error {
 	s.mu.Lock()
-	s.data = make(map[string]string)
-	s.mu.Unlock()
-	if err := s.Save(); err != nil {
-		return err
+	defer s.mu.Unlock()
+	next := make(map[string]string)
+	if err := s.write(s.path, next); err != nil {
+		return fmt.Errorf("write context tokens: %w", err)
 	}
-	_ = os.Remove(s.path)
+	s.data = next
 	return nil
+}
+
+func cloneContext(source map[string]string) map[string]string {
+	clone := make(map[string]string, len(source))
+	for key, value := range source {
+		clone[key] = value
+	}
+	return clone
 }

@@ -38,6 +38,7 @@ type Options struct {
 	CredPath         string
 	ContextTokenPath string
 	CursorPath       string
+	ReplayPath       string // optional persistent replay-dedupe state path
 	BotAgent         string // UA-style, e.g. "MyBot/1.2.0"
 	RouteTag         string // sent as SKRouteTag header
 	StripMarkdown    bool   // strip markdown from outbound text
@@ -62,6 +63,7 @@ type Bot struct {
 	middlewares   []Middleware
 	contextTokens *store.ContextStore
 	cursorStore   *store.CursorStore
+	replayStore   *store.ReplayStore
 	stopped       bool
 	mu            sync.Mutex
 	cancelPoll    context.CancelFunc
@@ -87,6 +89,9 @@ func New(opts ...Options) *Bot {
 	if o.CursorPath == "" && o.AccountID != "" {
 		o.CursorPath = filepath.Join(store.AccountStateDir(o.AccountID), "cursor.json")
 	}
+	if o.ReplayPath == "" && o.AccountID != "" {
+		o.ReplayPath = filepath.Join(store.AccountStateDir(o.AccountID), "replay_dedupe.json")
+	}
 	client := protocol.NewClient()
 	client.BotAgent = protocol.SanitizeBotAgent(o.BotAgent)
 	client.RouteTag = o.RouteTag
@@ -104,6 +109,7 @@ func New(opts ...Options) *Bot {
 		sessionGuard:  session.NewGuard(),
 		contextTokens: store.NewContextStore(o.AccountID, o.ContextTokenPath),
 		cursorStore:   store.NewCursorStore(o.AccountID, o.CursorPath),
+		replayStore:   store.NewReplayStore(o.AccountID, o.ReplayPath, store.DefaultReplayTTL),
 		hooks:         LifecycleHooks{},
 		logger:        logger,
 	}
@@ -140,6 +146,9 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 	}
 	if b.opts.CursorPath == "" {
 		b.cursorStore = store.NewCursorStore(b.opts.AccountID, "")
+	}
+	if b.opts.ReplayPath == "" {
+		b.replayStore = store.NewReplayStore(b.opts.AccountID, "", store.DefaultReplayTTL)
 	}
 	b.mu.Unlock()
 
@@ -179,6 +188,9 @@ func (b *Bot) Hooks() *LifecycleHooks {
 
 // Reply sends a text reply to an incoming message.
 func (b *Bot) Reply(ctx context.Context, msg *IncomingMessage, text string) error {
+	if err := requireContextToken(msg.UserID, msg.ContextToken); err != nil {
+		return err
+	}
 	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
 		b.log("warn", "failed to persist context token: %v", err)
 	}
@@ -192,8 +204,8 @@ func (b *Bot) Reply(ctx context.Context, msg *IncomingMessage, text string) erro
 // Send sends a text message to a user (requires prior context_token).
 func (b *Bot) Send(ctx context.Context, userID, text string) error {
 	ct := b.contextTokens.Get(userID)
-	if ct == "" {
-		return fmt.Errorf("no context_token for user %s", userID)
+	if err := requireContextToken(userID, ct); err != nil {
+		return err
 	}
 	if err := b.sendText(ctx, userID, text, ct); err != nil {
 		b.notifyError(ctx, userID, ct, err)
@@ -205,8 +217,8 @@ func (b *Bot) Send(ctx context.Context, userID, text string) error {
 // SendTyping shows the "typing..." indicator.
 func (b *Bot) SendTyping(ctx context.Context, userID string) error {
 	ct := b.contextTokens.Get(userID)
-	if ct == "" {
-		return fmt.Errorf("no context_token for user %s", userID)
+	if err := requireContextToken(userID, ct); err != nil {
+		return err
 	}
 	creds, configCache, err := b.readyConfig()
 	if err != nil {
@@ -322,6 +334,9 @@ func SendFileURL(url, fileName string) SendContent {
 
 // ReplyContent replies with any content type.
 func (b *Bot) ReplyContent(ctx context.Context, msg *IncomingMessage, content SendContent) error {
+	if err := requireContextToken(msg.UserID, msg.ContextToken); err != nil {
+		return err
+	}
 	if err := b.contextTokens.Set(msg.UserID, msg.ContextToken); err != nil {
 		b.log("warn", "failed to persist context token: %v", err)
 	}
@@ -342,8 +357,8 @@ func (b *Bot) ReplyContent(ctx context.Context, msg *IncomingMessage, content Se
 // SendMedia sends any content type to a user.
 func (b *Bot) SendMedia(ctx context.Context, userID string, content SendContent) error {
 	ct := b.contextTokens.Get(userID)
-	if ct == "" {
-		return fmt.Errorf("no context_token for user %s", userID)
+	if err := requireContextToken(userID, ct); err != nil {
+		return err
 	}
 	if _, err := b.readyCreds(); err != nil {
 		return err
@@ -415,6 +430,13 @@ func (b *Bot) Upload(ctx context.Context, data []byte, userID string, mediaType 
 	return b.cdnUpload(ctx, creds, data, userID, mediaType)
 }
 
+const updateQueueCapacity = 16
+
+type updateBatch struct {
+	messages []json.RawMessage
+	cursor   string
+}
+
 // Run starts the long-poll loop. Blocks until Stop() is called or context is cancelled.
 func (b *Bot) Run(ctx context.Context) error {
 	creds := b.getCreds()
@@ -427,10 +449,14 @@ func (b *Bot) Run(ctx context.Context) error {
 	pollCtx, cancel := context.WithCancel(ctx)
 	b.cancelPoll = cancel
 	b.mu.Unlock()
+	defer cancel()
 
 	b.log("info", "Long-poll loop started")
 	if loadErr := b.cursorStore.Load(); loadErr != nil {
 		b.log("warn", "Failed to load cursor: %v", loadErr)
+	}
+	if err := b.replayStore.Load(); err != nil {
+		return fmt.Errorf("load replay state: %w", err)
 	}
 
 	if err := b.hooks.BeforeLogin.Run(&Credentials{
@@ -455,14 +481,48 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 	}()
 
+	batches := make(chan updateBatch, updateQueueCapacity)
+	processorErrCh := make(chan error, 1)
+	processorDone := make(chan struct{})
+	go func() {
+		defer close(processorDone)
+		if err := b.processUpdateBatches(pollCtx, batches); err != nil {
+			processorErrCh <- err
+			cancel()
+		}
+	}()
+	defer func() {
+		cancel()
+		<-processorDone
+	}()
+
+	processorErr := func() error {
+		select {
+		case err := <-processorErrCh:
+			return fmt.Errorf("process updates: %w", err)
+		default:
+			return nil
+		}
+	}
+	stopResult := func() error {
+		if err := processorErr(); err != nil {
+			return err
+		}
+		b.log("info", "Long-poll loop stopped")
+		return nil
+	}
+
 	retryDelay := time.Second
 	pollTimeout := 45 * time.Second
+	pollCursor := b.cursorStore.Get()
 
 	for {
+		if err := processorErr(); err != nil {
+			return err
+		}
 		select {
 		case <-pollCtx.Done():
-			b.log("info", "Long-poll loop stopped")
-			return nil
+			return stopResult()
 		default:
 		}
 
@@ -472,19 +532,17 @@ func (b *Bot) Run(ctx context.Context) error {
 			select {
 			case <-pollCtx.Done():
 				timer.Stop()
-				b.log("info", "Long-poll loop stopped")
-				return nil
+				return stopResult()
 			case <-timer.C:
 				continue
 			}
 		}
 
 		creds = b.getCreds()
-		updates, err := b.client.GetUpdates(pollCtx, creds.BaseURL, creds.Token, b.cursorStore.Get(), pollTimeout)
+		updates, err := b.client.GetUpdates(pollCtx, creds.BaseURL, creds.Token, pollCursor, pollTimeout)
 		if err != nil {
 			if pollCtx.Err() != nil {
-				b.log("info", "Long-poll loop stopped")
-				return nil
+				return stopResult()
 			}
 
 			apiErr, isAPI := err.(*protocol.APIError)
@@ -496,43 +554,141 @@ func (b *Bot) Run(ctx context.Context) error {
 			}
 
 			b.reportError(err)
-			time.Sleep(retryDelay)
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-pollCtx.Done():
+				timer.Stop()
+				return stopResult()
+			case <-timer.C:
+			}
 			retryDelay = min(retryDelay*2, 10*time.Second)
 			continue
 		}
 
-		if updates.GetUpdatesBuf != "" {
-			if saveErr := b.cursorStore.Set(updates.GetUpdatesBuf); saveErr != nil {
-				b.log("warn", "Failed to save cursor: %v", saveErr)
-			}
-		}
 		if updates.LongPollingTimeoutMs > 0 {
 			pollTimeout = time.Duration(updates.LongPollingTimeoutMs) * time.Millisecond
 		}
 		retryDelay = time.Second
 
-		for _, rawMsg := range updates.Msgs {
-			var wire WireMessage
-			if err := json.Unmarshal(rawMsg, &wire); err != nil {
-				continue
+		nextCursor := pollCursor
+		if updates.GetUpdatesBuf != "" {
+			nextCursor = updates.GetUpdatesBuf
+		}
+		if len(updates.Msgs) > 0 || nextCursor != pollCursor {
+			batch := updateBatch{messages: updates.Msgs, cursor: nextCursor}
+			select {
+			case batches <- batch:
+				pollCursor = nextCursor
+			case err := <-processorErrCh:
+				return fmt.Errorf("process updates: %w", err)
+			case <-pollCtx.Done():
+				return stopResult()
 			}
-			b.rememberContext(&wire)
-			incoming := b.parseMessage(&wire)
-			if incoming == nil {
-				continue
+		}
+	}
+}
+
+func (b *Bot) processUpdateBatches(ctx context.Context, batches <-chan updateBatch) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case batch := <-batches:
+			if err := b.processUpdateBatch(ctx, batch); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
 			}
-			if err := b.hooks.AfterReceive.Run(incoming); err != nil {
-				b.log("warn", "AfterReceive hook failed: %v", err)
-				continue
-			}
-			if !b.runMiddleware(incoming) {
-				continue
-			}
+		}
+	}
+}
+
+func (b *Bot) processUpdateBatch(ctx context.Context, batch updateBatch) error {
+	for _, rawMsg := range batch.messages {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := b.processRawMessage(rawMsg); err != nil {
+			return err
+		}
+	}
+	if batch.cursor != "" && batch.cursor != b.cursorStore.Get() {
+		if err := b.cursorStore.Set(batch.cursor); err != nil {
+			return fmt.Errorf("commit cursor: %w", err)
+		}
+	}
+	return nil
+}
+
+func (b *Bot) processRawMessage(rawMsg json.RawMessage) error {
+	var wire WireMessage
+	if err := json.Unmarshal(rawMsg, &wire); err != nil {
+		return fmt.Errorf("decode incoming message: %w", err)
+	}
+
+	keys := replayKeys(&wire)
+	// replayKeys orders aliases strongest-first. A weaker alias may collide on a
+	// distinct delivery, so only the strongest identity present may suppress it.
+	if len(keys) > 0 && b.replayStore.SeenAny(keys[0]) {
+		b.log("debug", "Skipping replayed message with identity %s", keys[0])
+		return nil
+	}
+
+	b.rememberContext(&wire)
+	incoming := b.parseMessage(&wire)
+	if incoming != nil {
+		if err := b.hooks.AfterReceive.Run(incoming); err != nil {
+			b.log("warn", "AfterReceive hook failed: %v", err)
+		} else if b.runMiddleware(incoming) {
 			for _, h := range b.handlers {
 				h(incoming)
 			}
 		}
 	}
+
+	if len(keys) > 0 {
+		if err := b.replayStore.CommitAll(keys...); err != nil {
+			return fmt.Errorf("commit replay identities %v: %w", keys, err)
+		}
+	}
+	return nil
+}
+
+func replayKeys(wire *WireMessage) []string {
+	peer := peerUserID(wire)
+	if peer == "" {
+		return nil
+	}
+
+	prefix := "peer:" + strconv.Itoa(len(peer)) + ":" + peer + ":"
+	keys := make([]string, 0, 3)
+	if wire.MessageID != 0 {
+		keys = append(keys, prefix+"message:"+strconv.FormatInt(wire.MessageID, 10))
+	}
+	if wire.ClientID != "" {
+		keys = append(keys, prefix+"client:"+wire.ClientID)
+	}
+	if wire.Seq != 0 {
+		keys = append(keys, prefix+"seq:"+strconv.FormatInt(wire.Seq, 10))
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return keys
+}
+
+func peerUserID(wire *WireMessage) string {
+	if wire == nil {
+		return ""
+	}
+	if wire.MessageType == MessageTypeBot {
+		return wire.ToUserID
+	}
+	if wire.MessageType == MessageTypeUser {
+		return wire.FromUserID
+	}
+	return ""
 }
 
 // Stop gracefully stops the poll loop.
@@ -546,6 +702,13 @@ func (b *Bot) Stop() {
 }
 
 // --- internal ---
+
+func requireContextToken(userID, contextToken string) error {
+	if contextToken == "" {
+		return fmt.Errorf("no context_token for user %s", userID)
+	}
+	return nil
+}
 
 func (b *Bot) readyCreds() (*auth.Credentials, error) {
 	if err := b.sessionGuard.AssertActive(); err != nil {
@@ -573,6 +736,9 @@ func (b *Bot) readyConfig() (*auth.Credentials, *config.Cache, error) {
 }
 
 func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, content SendContent) error {
+	if err := requireContextToken(userID, contextToken); err != nil {
+		return err
+	}
 	if err := b.hooks.BeforeSend.Run(&content); err != nil {
 		return fmt.Errorf("BeforeSend hook failed: %w", err)
 	}
@@ -851,6 +1017,9 @@ func categorizeByExtension(filename string) string {
 }
 
 func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) error {
+	if err := requireContextToken(userID, contextToken); err != nil {
+		return err
+	}
 	creds, err := b.readyCreds()
 	if err != nil {
 		return err
@@ -872,6 +1041,9 @@ func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) e
 // Errors are best-effort; failures to send the notice are logged but not returned.
 func (b *Bot) notifyError(ctx context.Context, userID, contextToken string, err error) {
 	if !b.opts.NotifyErrors {
+		return
+	}
+	if requireContextToken(userID, contextToken) != nil {
 		return
 	}
 	if b.sessionGuard.AssertActive() != nil {

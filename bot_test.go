@@ -3,11 +3,14 @@ package wechatbot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -511,5 +514,501 @@ func TestCredentialsJSON(t *testing.T) {
 	}
 	if _, ok := m["accountId"]; !ok {
 		t.Fatal("expected camelCase 'accountId' in JSON")
+	}
+}
+
+func TestReplayKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		wire *WireMessage
+		want []string
+	}{
+		{
+			name: "all user message aliases",
+			wire: &WireMessage{
+				MessageID:   42,
+				ClientID:    "client-1",
+				Seq:         7,
+				FromUserID:  "user-1",
+				ToUserID:    "bot-1",
+				MessageType: MessageTypeUser,
+			},
+			want: []string{
+				"peer:6:user-1:message:42",
+				"peer:6:user-1:client:client-1",
+				"peer:6:user-1:seq:7",
+			},
+		},
+		{
+			name: "bot message uses recipient as peer",
+			wire: &WireMessage{
+				MessageID:   42,
+				FromUserID:  "bot-1",
+				ToUserID:    "user-1",
+				MessageType: MessageTypeBot,
+			},
+			want: []string{"peer:6:user-1:message:42"},
+		},
+		{
+			name: "missing identity",
+			wire: &WireMessage{FromUserID: "user-1", MessageType: MessageTypeUser},
+		},
+		{
+			name: "missing peer",
+			wire: &WireMessage{MessageID: 42, MessageType: MessageTypeUser},
+		},
+		{name: "nil message"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := replayKeys(tc.wire); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("replayKeys() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProcessUpdateBatchRejectsMalformedMessageWithoutAdvancingCursor(t *testing.T) {
+	bot := newReplayTestBot(t)
+	if err := bot.cursorStore.Set("cursor-before"); err != nil {
+		t.Fatal(err)
+	}
+
+	err := bot.processUpdateBatch(context.Background(), updateBatch{
+		messages: []json.RawMessage{json.RawMessage(`{"message_id":"invalid"}`)},
+		cursor:   "cursor-after",
+	})
+	if err == nil {
+		t.Fatal("expected malformed message error")
+	}
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) {
+		t.Fatalf("error does not preserve JSON decode cause: %v", err)
+	}
+	if got := bot.cursorStore.Get(); got != "cursor-before" {
+		t.Fatalf("cursor advanced after malformed message: %q", got)
+	}
+}
+
+func TestRunRetriesMalformedMessageFromPersistedCursor(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{
+		ContextTokenPath: filepath.Join(dir, "context_tokens.json"),
+		CursorPath:       filepath.Join(dir, "cursor.json"),
+		ReplayPath:       filepath.Join(dir, "replay_dedupe.json"),
+	}
+	seed := New(opts)
+	if err := seed.cursorStore.Set("cursor-before"); err != nil {
+		t.Fatalf("seed cursor: %v", err)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		firstCursor := make(chan string, 1)
+		releasePoll := make(chan struct{})
+		var polls atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
+				_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+			case "/ilink/bot/getupdates":
+				if polls.Add(1) != 1 {
+					select {
+					case <-releasePoll:
+					case <-r.Context().Done():
+					}
+					return
+				}
+				var request struct {
+					Cursor string `json:"get_updates_buf"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Errorf("decode getupdates request: %v", err)
+					return
+				}
+				firstCursor <- request.Cursor
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"ret":             0,
+					"msgs":            []json.RawMessage{json.RawMessage(`{"message_id":"invalid"}`)},
+					"get_updates_buf": "cursor-after",
+				})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+
+		bot := New(opts)
+		bot.client.HTTP = server.Client()
+		bot.creds = &auth.Credentials{BaseURL: server.URL, Token: "token", AccountID: "bot-1"}
+		err := bot.Run(context.Background())
+		close(releasePoll)
+		server.Close()
+		if err == nil {
+			t.Fatalf("attempt %d: expected malformed message error", attempt)
+		}
+		var typeErr *json.UnmarshalTypeError
+		if !errors.As(err, &typeErr) {
+			t.Fatalf("attempt %d: error does not preserve JSON decode cause: %v", attempt, err)
+		}
+		select {
+		case got := <-firstCursor:
+			if got != "cursor-before" {
+				t.Fatalf("attempt %d: poll cursor = %q, want cursor-before", attempt, got)
+			}
+		default:
+			t.Fatalf("attempt %d: getupdates request was not observed", attempt)
+		}
+
+		persisted := New(opts)
+		if err := persisted.cursorStore.Load(); err != nil {
+			t.Fatalf("attempt %d: reload cursor: %v", attempt, err)
+		}
+		if got := persisted.cursorStore.Get(); got != "cursor-before" {
+			t.Fatalf("attempt %d: persisted cursor = %q, want cursor-before", attempt, got)
+		}
+	}
+}
+
+func TestProcessUpdateBatchScopesIdentityByPeer(t *testing.T) {
+	bot := newReplayTestBot(t)
+
+	var handled atomic.Int32
+	bot.OnMessage(func(msg *IncomingMessage) {
+		handled.Add(1)
+	})
+
+	if err := bot.processUpdateBatch(context.Background(), updateBatch{
+		messages: []json.RawMessage{
+			marshalWireMessage(t, WireMessage{
+				MessageID:   42,
+				FromUserID:  "user-1",
+				ToUserID:    "bot-1",
+				MessageType: MessageTypeUser,
+			}),
+			marshalWireMessage(t, WireMessage{
+				MessageID:   42,
+				FromUserID:  "user-2",
+				ToUserID:    "bot-1",
+				MessageType: MessageTypeUser,
+			}),
+		},
+		cursor: "cursor-1",
+	}); err != nil {
+		t.Fatalf("process batch: %v", err)
+	}
+
+	if got := handled.Load(); got != 2 {
+		t.Fatalf("handler called %d times, want 2", got)
+	}
+	for _, key := range []string{
+		"peer:6:user-1:message:42",
+		"peer:6:user-2:message:42",
+	} {
+		if !bot.replayStore.SeenAny(key) {
+			t.Fatalf("handled identity %q was not persisted", key)
+		}
+	}
+}
+
+func TestProcessUpdateBatchDeduplicatesAnyCommittedAlias(t *testing.T) {
+	bot := newReplayTestBot(t)
+
+	var handled atomic.Int32
+	bot.OnMessage(func(msg *IncomingMessage) {
+		handled.Add(1)
+	})
+	messages := []WireMessage{
+		{
+			MessageID:   42,
+			ClientID:    "client-1",
+			Seq:         7,
+			FromUserID:  "user-1",
+			ToUserID:    "bot-1",
+			MessageType: MessageTypeUser,
+		},
+		{
+			ClientID:    "client-1",
+			FromUserID:  "user-1",
+			ToUserID:    "bot-1",
+			MessageType: MessageTypeUser,
+		},
+		{
+			Seq:         7,
+			FromUserID:  "user-1",
+			ToUserID:    "bot-1",
+			MessageType: MessageTypeUser,
+		},
+	}
+	for i, wire := range messages {
+		if err := bot.processUpdateBatch(context.Background(), updateBatch{
+			messages: []json.RawMessage{marshalWireMessage(t, wire)},
+			cursor:   "cursor-" + strconv.Itoa(i+1),
+		}); err != nil {
+			t.Fatalf("delivery %d failed: %v", i+1, err)
+		}
+	}
+
+	if got := handled.Load(); got != 1 {
+		t.Fatalf("handler called %d times, want 1", got)
+	}
+	for _, key := range replayKeys(&messages[0]) {
+		if !bot.replayStore.SeenAny(key) {
+			t.Fatalf("handled identity %q was not persisted", key)
+		}
+	}
+	if got := bot.cursorStore.Get(); got != "cursor-3" {
+		t.Fatalf("cursor = %q, want cursor-3", got)
+	}
+}
+
+func TestProcessUpdateBatchPrefersMessageIDOverCollidingFallbackAliases(t *testing.T) {
+	bot := newReplayTestBot(t)
+
+	var handled atomic.Int32
+	bot.OnMessage(func(msg *IncomingMessage) {
+		handled.Add(1)
+	})
+	messages := []WireMessage{
+		{
+			MessageID:   1,
+			ClientID:    "client-1",
+			Seq:         7,
+			FromUserID:  "user-1",
+			MessageType: MessageTypeUser,
+		},
+		{
+			MessageID:   2,
+			ClientID:    "client-1",
+			Seq:         7,
+			FromUserID:  "user-1",
+			MessageType: MessageTypeUser,
+		},
+		{
+			ClientID:    "client-1",
+			FromUserID:  "user-1",
+			MessageType: MessageTypeUser,
+		},
+		{
+			Seq:         7,
+			FromUserID:  "user-1",
+			MessageType: MessageTypeUser,
+		},
+	}
+	for i, wire := range messages {
+		if err := bot.processRawMessage(marshalWireMessage(t, wire)); err != nil {
+			t.Fatalf("delivery %d failed: %v", i+1, err)
+		}
+	}
+
+	if got := handled.Load(); got != 2 {
+		t.Fatalf("handler called %d times, want 2", got)
+	}
+	for _, key := range []string{
+		"peer:6:user-1:message:1",
+		"peer:6:user-1:message:2",
+		"peer:6:user-1:client:client-1",
+		"peer:6:user-1:seq:7",
+	} {
+		if !bot.replayStore.SeenAny(key) {
+			t.Fatalf("handled identity %q was not persisted", key)
+		}
+	}
+}
+
+func TestProcessUpdateBatchKeepsAtLeastOnceWithoutIdentityOrPeer(t *testing.T) {
+	bot := newReplayTestBot(t)
+
+	var handled atomic.Int32
+	bot.OnMessage(func(msg *IncomingMessage) {
+		handled.Add(1)
+	})
+	messages := []WireMessage{
+		{FromUserID: "user-1", ToUserID: "bot-1", MessageType: MessageTypeUser},
+		{MessageID: 42, ToUserID: "bot-1", MessageType: MessageTypeUser},
+	}
+	for _, wire := range messages {
+		if keys := replayKeys(&wire); len(keys) != 0 {
+			t.Fatalf("replayKeys(%+v) = %q, want no keys", wire, keys)
+		}
+		for delivery := 0; delivery < 2; delivery++ {
+			if err := bot.processRawMessage(marshalWireMessage(t, wire)); err != nil {
+				t.Fatalf("process message: %v", err)
+			}
+		}
+	}
+
+	if got := handled.Load(); got != 4 {
+		t.Fatalf("handler called %d times, want 4", got)
+	}
+}
+
+func TestRunContinuesPollingBeforeHandlerCompletes(t *testing.T) {
+	dir := t.TempDir()
+	raw := marshalWireMessage(t, WireMessage{
+		MessageID:    101,
+		FromUserID:   "user-1",
+		ToUserID:     "bot-1",
+		MessageType:  MessageTypeUser,
+		MessageState: MessageStateFinish,
+		ContextToken: "context-1",
+		ItemList: []MessageItem{
+			{Type: ItemText, TextItem: &TextItem{Text: "hello"}},
+		},
+	})
+
+	var polls atomic.Int32
+	secondPollStarted := make(chan struct{}, 1)
+	releaseSecondPoll := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/ilink/bot/msg/notifystart", "/ilink/bot/msg/notifystop":
+			_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+		case "/ilink/bot/getupdates":
+			if polls.Add(1) == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"ret":             0,
+					"msgs":            []json.RawMessage{raw},
+					"get_updates_buf": "cursor-1",
+				})
+				return
+			}
+			select {
+			case secondPollStarted <- struct{}{}:
+			default:
+			}
+			select {
+			case <-releaseSecondPoll:
+			case <-r.Context().Done():
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	defer func() {
+		select {
+		case releaseSecondPoll <- struct{}{}:
+		default:
+		}
+	}()
+
+	bot := New(Options{
+		ContextTokenPath: filepath.Join(dir, "context_tokens.json"),
+		CursorPath:       filepath.Join(dir, "cursor.json"),
+		ReplayPath:       filepath.Join(dir, "replay_dedupe.json"),
+	})
+	bot.client.HTTP = server.Client()
+	bot.creds = &auth.Credentials{BaseURL: server.URL, Token: "token", AccountID: "bot-1"}
+
+	handlerStarted := make(chan struct{}, 1)
+	releaseHandler := make(chan struct{})
+	bot.OnMessage(func(msg *IncomingMessage) {
+		select {
+		case handlerStarted <- struct{}{}:
+		default:
+		}
+		<-releaseHandler
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- bot.Run(ctx)
+	}()
+
+	waitForSignal(t, handlerStarted, "handler start")
+	waitForSignal(t, secondPollStarted, "second getUpdates request")
+	if got := bot.cursorStore.Get(); got != "" {
+		t.Fatalf("cursor committed before handler completion: %q", got)
+	}
+
+	cancel()
+	releaseSecondPoll <- struct{}{}
+	close(releaseHandler)
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop")
+	}
+	if got := bot.cursorStore.Get(); got != "cursor-1" {
+		t.Fatalf("cursor = %q after handler completion, want cursor-1", got)
+	}
+}
+
+func TestReplyRejectsMissingContextTokenBeforeSend(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+	}))
+	defer server.Close()
+
+	bot := New()
+	bot.client.HTTP = server.Client()
+	bot.creds = &auth.Credentials{BaseURL: server.URL, Token: "token"}
+	err := bot.Reply(context.Background(), &IncomingMessage{UserID: "user-1"}, "hello")
+	if err == nil || !strings.Contains(err.Error(), "no context_token") {
+		t.Fatalf("expected missing context_token error, got %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("unexpected network requests: %d", got)
+	}
+}
+
+func TestReplyContentRejectsMissingContextTokenBeforeDownload(t *testing.T) {
+	var downloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		_, _ = w.Write([]byte("image"))
+	}))
+	defer server.Close()
+
+	bot := New()
+	bot.creds = &auth.Credentials{BaseURL: "https://example.com", Token: "token"}
+	err := bot.ReplyContent(
+		context.Background(),
+		&IncomingMessage{UserID: "user-1"},
+		SendImageURL(server.URL),
+	)
+	if err == nil || !strings.Contains(err.Error(), "no context_token") {
+		t.Fatalf("expected missing context_token error, got %v", err)
+	}
+	if got := downloads.Load(); got != 0 {
+		t.Fatalf("remote media downloaded before token validation: %d", got)
+	}
+}
+
+func newReplayTestBot(t *testing.T) *Bot {
+	t.Helper()
+	dir := t.TempDir()
+	bot := New(Options{
+		ContextTokenPath: filepath.Join(dir, "context_tokens.json"),
+		CursorPath:       filepath.Join(dir, "cursor.json"),
+		ReplayPath:       filepath.Join(dir, "replay_dedupe.json"),
+	})
+	if err := bot.replayStore.Load(); err != nil {
+		t.Fatal(err)
+	}
+	return bot
+}
+
+func marshalWireMessage(t *testing.T, wire WireMessage) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
 	}
 }
