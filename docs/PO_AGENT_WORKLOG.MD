@@ -31,3 +31,5 @@
 - Closed reliable-delivery failure gaps: malformed wire messages now fail closed, replay identities are conversation-scoped and committed as one alias set, and credential/replay/cursor/context JSON state uses atomic replacement with disk-before-memory publication.
 
 - Made explicit reauthentication recoverable across process crashes after the durable commit point: a per-credential marker blocks normal login while a transition is active, records every context path, survives fresh credential acquisition, and is removed only immediately before publishing the validated fresh session. Sudden-power-loss directory durability remains outside the atomic-write contract.
+
+- Bumped the SDK fallback protocol version to `0.4.0` and prepared the source-only Go module release after the reliable-delivery, Agent-envelope, outbound-identity, typed-error, and explicit-reauthentication stack merged to `main`.
