@@ -43,7 +43,7 @@ Timeout: 35s (server holds connection)
 → { ret: 0, msgs: [], get_updates_buf: "<new_cursor>" }
 ```
 
-Error: `errcode: -14` = session expired (re-login needed)
+Error: `ret: -14` or `errcode: -14` = session expired (explicit reauthentication needed)
 
 ## Send Message
 
@@ -127,7 +127,7 @@ Messages may carry `session_id`, `group_id`, and `run_id` for Agent correlation.
 | Code | Meaning | Action |
 |------|---------|--------|
 | `ret: 0` | Success | — |
-| `ret: -14` or `errcode: -14` | Session expired | Re-login |
+| `ret: -14` or `errcode: -14` | Session expired | Call `Reauthenticate` explicitly |
 | `ret: -2` | Parameter error | Check request |
 
 `APIError` preserves the endpoint, HTTP status, `ret`, and `errcode` separately;
@@ -138,4 +138,4 @@ use `errors.As` to inspect it through wrapped SDK errors.
 - **Required** for every reply — routes messages to the correct conversation
 - Cache per `(accountId, userId)` pair
 - Persist across restarts
-- Clear on session expiry / re-login
+- Clear on session expiry / explicit reauthentication. A durable SDK-local marker (not a wire-protocol field) blocks ordinary login across process restarts until fresh credentials and cleared context state are installed.

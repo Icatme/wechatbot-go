@@ -403,20 +403,23 @@ func TestReplyContentWithoutLoginDoesNotDownloadRemote(t *testing.T) {
 	}
 }
 
-func TestSendBlockedWhenSessionPaused(t *testing.T) {
+func TestSendBlockedWhenReauthenticationRequired(t *testing.T) {
 	dir := t.TempDir()
-	b := New(Options{ContextTokenPath: filepath.Join(dir, "context_tokens.json")})
+	b := New(Options{
+		CredPath:         filepath.Join(dir, "credentials.json"),
+		ContextTokenPath: filepath.Join(dir, "context_tokens.json"),
+	})
 	if err := b.contextTokens.Set("user123", "ctx"); err != nil {
 		t.Fatal(err)
 	}
 	b.mu.Lock()
 	b.creds = &auth.Credentials{BaseURL: "https://example.com", Token: "token"}
 	b.mu.Unlock()
-	b.sessionGuard.Pause()
+	b.requireReauthentication(&APIError{RetCode: -14, Message: "expired"})
 
 	err := b.Send(context.Background(), "user123", "hello")
-	if err == nil || !strings.Contains(err.Error(), "session paused") {
-		t.Fatalf("expected session paused error, got %v", err)
+	if !errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("expected reauthentication error, got %v", err)
 	}
 }
 

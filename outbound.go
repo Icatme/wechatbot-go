@@ -3,6 +3,7 @@ package wechatbot
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"time"
 
@@ -96,10 +97,14 @@ func normalizeToolCallStatus(status ToolCallStatus) ToolCallStatus {
 
 // SendMessage sends exactly one message item to a user.
 func (b *Bot) SendMessage(ctx context.Context, userID string, msg OutboundMessage) (SendResult, error) {
-	contextToken := b.contextTokens.Get(userID)
-	result, err := b.sendMessage(ctx, userID, contextToken, msg)
+	_, sessionGeneration, err := b.readySessionForContext(ctx)
 	if err != nil {
-		b.notifyError(ctx, userID, contextToken, err)
+		return SendResult{}, err
+	}
+	contextToken := b.contextTokens.Get(userID)
+	result, err := b.sendMessage(ctx, sessionGeneration, userID, contextToken, msg)
+	if err != nil {
+		b.notifyError(ctx, sessionGeneration, userID, contextToken, err)
 	}
 	return result, err
 }
@@ -110,32 +115,39 @@ func (b *Bot) ReplyMessage(ctx context.Context, inbound *IncomingMessage, msg Ou
 	if inbound == nil {
 		return SendResult{}, fmt.Errorf("inbound message is nil")
 	}
+	sessionGeneration, err := b.incomingSessionGeneration(inbound)
+	if err != nil {
+		return SendResult{}, err
+	}
 	if err := requireContextToken(inbound.UserID, inbound.ContextToken); err != nil {
 		return SendResult{}, err
 	}
-	if err := b.contextTokens.Set(inbound.UserID, inbound.ContextToken); err != nil {
+	if err := b.persistContextToken(sessionGeneration, inbound.UserID, inbound.ContextToken); err != nil {
+		if errors.Is(err, ErrReauthRequired) {
+			return SendResult{}, err
+		}
 		b.log("warn", "failed to persist context token: %v", err)
 	}
-	result, err := b.sendMessage(ctx, inbound.UserID, inbound.ContextToken, msg)
+	result, err := b.sendMessage(ctx, sessionGeneration, inbound.UserID, inbound.ContextToken, msg)
 	if err != nil {
-		b.notifyError(ctx, inbound.UserID, inbound.ContextToken, err)
+		b.notifyError(ctx, sessionGeneration, inbound.UserID, inbound.ContextToken, err)
 	}
 	return result, err
 }
 
-func (b *Bot) sendMessage(ctx context.Context, userID, contextToken string, msg OutboundMessage) (SendResult, error) {
+func (b *Bot) sendMessage(ctx context.Context, sessionGeneration uint64, userID, contextToken string, msg OutboundMessage) (SendResult, error) {
 	if err := requireContextToken(userID, contextToken); err != nil {
 		return SendResult{}, err
 	}
-	creds, err := b.readyCreds()
-	if err != nil {
+	if _, err := b.readySession(sessionGeneration); err != nil {
 		return SendResult{}, err
 	}
 	if msg.ClientID == "" {
-		msg.ClientID, err = newClientID()
+		clientID, err := newClientID()
 		if err != nil {
 			return SendResult{}, err
 		}
+		msg.ClientID = clientID
 	}
 
 	validatedUserID := userID
@@ -154,7 +166,6 @@ func (b *Bot) sendMessage(ctx context.Context, userID, contextToken string, msg 
 	if err := validateOutboundMessage(request.Message); err != nil {
 		return result, err
 	}
-
 	result.RunID = request.Message.RunID
 	wire := protocol.BuildMessage(
 		request.UserID,
@@ -163,7 +174,13 @@ func (b *Bot) sendMessage(ctx context.Context, userID, contextToken string, msg 
 		request.Message.RunID,
 		request.Message.Item,
 	)
-	sendErr := b.client.SendMessage(ctx, creds.BaseURL, creds.Token, wire)
+	token, sendErr := b.authenticatedRequest(ctx, sessionGeneration, func(requestContext context.Context, baseURL, token string) error {
+		return b.client.SendMessage(requestContext, baseURL, token, wire)
+	})
+	if token == "" {
+		return result, sendErr
+	}
+	sendErr = b.handleAuthenticatedErrorForSession(sessionGeneration, token, sendErr)
 	outcome := SendOutcome{Request: request, Result: result, Err: sendErr}
 	if hookErr := b.hooks.AfterSend.Run(outcome); hookErr != nil {
 		b.reportError(fmt.Errorf("AfterSend hook failed: %w", hookErr))

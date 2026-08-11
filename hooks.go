@@ -43,9 +43,10 @@ func (r *HookRegistry[T]) Run(payload T) error {
 
 // LifecycleHooks group all available bot hooks.
 type LifecycleHooks struct {
-	// BeforeLogin runs after QR/login starts but before credentials are finalized.
+	// BeforeLogin runs after credentials are acquired but before Bot installs them.
+	// It receives an isolated snapshot; reentrant attempts to start authentication are rejected.
 	BeforeLogin HookRegistry[*Credentials]
-	// AfterLogin runs after credentials are loaded or created.
+	// AfterLogin runs after credentials are loaded or created and receives its own snapshot.
 	AfterLogin HookRegistry[*Credentials]
 	// OnError runs when the bot encounters a non-fatal runtime error.
 	OnError HookRegistry[error]
