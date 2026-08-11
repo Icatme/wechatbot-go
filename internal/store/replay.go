@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/Icatme/wechatbot-go/internal/persist"
 )
 
 // DefaultReplayTTL is the window in which a handled message identity is ignored.
@@ -22,6 +24,7 @@ type ReplayStore struct {
 	path   string
 	ttl    time.Duration
 	now    func() time.Time
+	write  func(string, any) error
 	mu     sync.RWMutex
 	seenAt map[string]int64
 }
@@ -38,6 +41,7 @@ func NewReplayStore(accountID, path string, ttl time.Duration) *ReplayStore {
 		path:   path,
 		ttl:    ttl,
 		now:    time.Now,
+		write:  persist.WriteJSONAtomic,
 		seenAt: make(map[string]int64),
 	}
 }
@@ -70,56 +74,76 @@ func (s *ReplayStore) Load() error {
 	if parsed.SeenAt == nil {
 		parsed.SeenAt = make(map[string]int64)
 	}
+	pruneReplay(parsed.SeenAt, s.now(), s.ttl)
 	s.seenAt = parsed.SeenAt
-	s.pruneLocked(s.now())
 	return nil
 }
 
 // Seen reports whether key was committed within the replay window.
 func (s *ReplayStore) Seen(key string) bool {
-	if key == "" {
-		return false
+	return s.SeenAny(key)
+}
+
+// SeenAny reports whether any key was committed within the replay window.
+func (s *ReplayStore) SeenAny(keys ...string) bool {
+	cutoff := s.now().Add(-s.ttl).UnixMilli()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+		if seenAt, ok := s.seenAt[key]; ok && seenAt >= cutoff {
+			return true
+		}
 	}
-	now := s.now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pruneLocked(now)
-	_, ok := s.seenAt[key]
-	return ok
+	return false
 }
 
 // Commit records key as successfully handled and persists it.
 func (s *ReplayStore) Commit(key string) error {
-	if key == "" {
-		return nil
-	}
+	return s.CommitAll(key)
+}
+
+// CommitAll records keys with one atomic persistence operation.
+func (s *ReplayStore) CommitAll(keys ...string) error {
 	now := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pruneLocked(now)
-	s.seenAt[key] = now.UnixMilli()
-	return s.saveLocked()
-}
 
-func (s *ReplayStore) pruneLocked(now time.Time) {
-	cutoff := now.Add(-s.ttl).UnixMilli()
-	for key, seenAt := range s.seenAt {
-		if seenAt < cutoff {
-			delete(s.seenAt, key)
+	next := cloneReplay(s.seenAt)
+	pruneReplay(next, now, s.ttl)
+	hasKey := false
+	for _, key := range keys {
+		if key == "" {
+			continue
 		}
+		next[key] = now.UnixMilli()
+		hasKey = true
 	}
-}
-
-func (s *ReplayStore) saveLocked() error {
-	if err := ensureDir(filepath.Dir(s.path)); err != nil {
-		return fmt.Errorf("ensure replay state dir: %w", err)
+	if !hasKey {
+		return nil
 	}
-	out, err := json.MarshalIndent(replayData{SeenAt: s.seenAt}, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode replay state: %w", err)
-	}
-	if err := os.WriteFile(s.path, append(out, '\n'), 0600); err != nil {
+	if err := s.write(s.path, replayData{SeenAt: next}); err != nil {
 		return fmt.Errorf("write replay state: %w", err)
 	}
+	s.seenAt = next
 	return nil
+}
+
+func cloneReplay(source map[string]int64) map[string]int64 {
+	clone := make(map[string]int64, len(source))
+	for key, seenAt := range source {
+		clone[key] = seenAt
+	}
+	return clone
+}
+
+func pruneReplay(seenAt map[string]int64, now time.Time, ttl time.Duration) {
+	cutoff := now.Add(-ttl).UnixMilli()
+	for key, timestamp := range seenAt {
+		if timestamp < cutoff {
+			delete(seenAt, key)
+		}
+	}
 }

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -34,8 +35,39 @@ func TestCursorStoreClear(t *testing.T) {
 	if s.Get() != "" {
 		t.Fatal("expected empty after clear")
 	}
-	if _, err := os.Stat(s.Path()); !os.IsNotExist(err) {
-		t.Fatal("expected file removed after clear")
+	data, err := os.ReadFile(s.Path())
+	if err != nil {
+		t.Fatalf("read cleared cursor: %v", err)
+	}
+	if got, want := string(data), "{\n  \"get_updates_buf\": \"\"\n}\n"; got != want {
+		t.Fatalf("cleared cursor file = %q, want %q", got, want)
+	}
+}
+
+func TestCursorStoreSetFailureKeepsMemoryAndDisk(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cursor.json")
+	s := NewCursorStore("", path)
+	if err := s.Set("old"); err != nil {
+		t.Fatalf("set old cursor: %v", err)
+	}
+	oldDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read old cursor: %v", err)
+	}
+	s.write = func(string, any) error { return errors.New("injected write failure") }
+
+	if err := s.Set("new"); err == nil {
+		t.Fatal("expected set failure")
+	}
+	if got := s.Get(); got != "old" {
+		t.Fatalf("cursor memory = %q, want old", got)
+	}
+	newDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cursor after failure: %v", err)
+	}
+	if string(newDisk) != string(oldDisk) {
+		t.Fatalf("cursor disk changed after failure: %q", newDisk)
 	}
 }
 

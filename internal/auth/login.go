@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Icatme/wechatbot-go/internal/persist"
 	"github.com/Icatme/wechatbot-go/internal/protocol"
 )
 
@@ -51,12 +52,7 @@ func SaveCredentials(creds *Credentials, path string) error {
 	if path == "" {
 		path = DefaultCredPath()
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
-	data, _ := json.MarshalIndent(creds, "", "  ")
-	return os.WriteFile(path, append(data, '\n'), 0600)
+	return persist.WriteJSONAtomic(path, creds)
 }
 
 // ClearCredentials removes stored credentials.
