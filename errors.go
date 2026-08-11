@@ -25,8 +25,9 @@ var (
 // endpoint, HTTP status, ret, and errcode dimensions.
 type APIError = protocol.APIError
 
-// ReauthRequiredError preserves the API error that invalidated the session and
-// any local cleanup failure. It always matches ErrReauthRequired.
+// ReauthRequiredError preserves the error that invalidated or restored the
+// terminal session state, when available, plus any local cleanup failure. It
+// always matches ErrReauthRequired.
 type ReauthRequiredError struct {
 	Cause      error
 	CleanupErr error
@@ -42,7 +43,7 @@ func (e *ReauthRequiredError) Error() string {
 	return ErrReauthRequired.Error()
 }
 
-// Unwrap preserves the original API error for errors.As.
+// Unwrap preserves the original cause for errors.As.
 func (e *ReauthRequiredError) Unwrap() error { return e.Cause }
 
 // Is makes every ReauthRequiredError match ErrReauthRequired.

@@ -62,7 +62,7 @@ All SDKs implement the same flow:
 3. Serialize each user's token persistence and delivery while handling unrelated users concurrently
 4. Run `AfterReceive`, middleware, and the configured handler
 5. Commit each replay identity after Ack/Drop, then advance the global cursor only through the contiguous completed-batch prefix
-6. On `-14` error → clear invalid credentials/context and require explicit reauthentication
+6. On `-14` error → persist a fail-closed marker, clear invalid credentials/context, and require explicit reauthentication; preserve cursor/replay, then remove the marker only after a validated same-account credential and empty context state are durable and before publishing the fresh session
 7. On network error → exponential backoff (1s → 10s max)
 
 ### Media Pipeline

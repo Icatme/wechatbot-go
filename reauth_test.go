@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Icatme/wechatbot-go/internal/auth"
+	"github.com/Icatme/wechatbot-go/internal/store"
 )
 
 type sessionTestPaths struct {
@@ -1381,6 +1382,335 @@ func TestCleanupFailureRemainsFailClosedUntilRetrySucceeds(t *testing.T) {
 	}
 	if creds.Token != "fresh-token" || requests.Load() != 2 {
 		t.Fatalf("recovered credentials = %+v, requests = %d", creds, requests.Load())
+	}
+}
+
+func TestDurableReauthenticationMarkerBlocksLoginAndRecoversAllContextPaths(t *testing.T) {
+	dir := t.TempDir()
+	paths := sessionTestPaths{
+		credentials: filepath.Join(dir, "credentials.json"),
+		context:     filepath.Join(dir, "current-context.json"),
+		cursor:      filepath.Join(dir, "cursor.json"),
+		replay:      filepath.Join(dir, "replay.json"),
+	}
+	recordedContextPath := filepath.Join(dir, "recorded-context.json")
+	if err := auth.SaveCredentials(&auth.Credentials{Token: "uninstalled-candidate", AccountID: "bot-1", UserID: "user-1"}, paths.credentials); err != nil {
+		t.Fatalf("save crash-window credentials: %v", err)
+	}
+	for _, path := range []string{paths.context, recordedContextPath} {
+		if err := store.NewContextStore("", path).Set("user-1", "stale-context"); err != nil {
+			t.Fatalf("seed context %q: %v", path, err)
+		}
+	}
+	marker := store.NewReauthStore(store.ReauthStatePath(paths.credentials))
+	if err := marker.Mark(store.ReauthRecord{
+		InvalidTokenSHA256: tokenSHA256("invalid-token"),
+		AccountID:          "bot-1",
+		ContextPaths:       []string{recordedContextPath},
+	}); err != nil {
+		t.Fatalf("seed reauthentication marker: %v", err)
+	}
+
+	bot := New(Options{
+		AccountID:        "bot-1",
+		CredPath:         paths.credentials,
+		ContextTokenPath: paths.context,
+		CursorPath:       paths.cursor,
+		ReplayPath:       paths.replay,
+		LogLevel:         "silent",
+	})
+	if !bot.ReauthRequired() {
+		t.Fatal("durable marker was not visible before Login")
+	}
+	var loginRequests atomic.Int32
+	bot.client.HTTP = &http.Client{Transport: rootRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		loginRequests.Add(1)
+		return nil, fmt.Errorf("unexpected Login request: %s", req.URL.Path)
+	})}
+	if _, err := bot.Login(context.Background(), false); !errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("Login with durable marker = %v", err)
+	}
+	if !bot.ReauthRequired() {
+		t.Fatal("durable marker did not publish terminal reauthentication state")
+	}
+	if got := loginRequests.Load(); got != 0 {
+		t.Fatalf("Login with durable marker made %d network requests", got)
+	}
+	if _, err := os.Stat(paths.credentials); !os.IsNotExist(err) {
+		t.Fatalf("candidate credentials survived marker recovery: %v", err)
+	}
+	for _, path := range []string{paths.context, recordedContextPath} {
+		reloaded := store.NewContextStore("", path)
+		if err := reloaded.Load(); err != nil {
+			t.Fatalf("load cleared context %q: %v", path, err)
+		}
+		if len(reloaded.All()) != 0 {
+			t.Fatalf("stale context survived at %q: %v", path, reloaded.All())
+		}
+	}
+
+	markerDuringQR := false
+	bot.client.HTTP = &http.Client{Transport: rootRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body string
+		switch req.URL.Path {
+		case "/ilink/bot/get_bot_qrcode":
+			if _, err := os.Stat(marker.Path()); err != nil {
+				return nil, fmt.Errorf("marker missing during QR request: %w", err)
+			}
+			markerDuringQR = true
+			body = `{"qrcode":"qr","qrcode_img_content":"https://example.com/qr"}`
+		case "/ilink/bot/get_qrcode_status":
+			body = `{"status":"confirmed","bot_token":"fresh-token","ilink_bot_id":"bot-1","ilink_user_id":"user-1","baseurl":"https://fresh.example"}`
+		default:
+			return nil, fmt.Errorf("unexpected reauthentication request: %s", req.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})}
+	creds, err := bot.Reauthenticate(context.Background())
+	if err != nil || creds.Token != "fresh-token" {
+		t.Fatalf("Reauthenticate after marker recovery = %+v, %v", creds, err)
+	}
+	if !markerDuringQR {
+		t.Fatal("fresh authentication did not retain marker across credential acquisition")
+	}
+	if _, err := os.Stat(marker.Path()); !os.IsNotExist(err) {
+		t.Fatalf("marker survived successful installation: %v", err)
+	}
+}
+
+func TestReauthenticationMarkerFailureDestroysStaleSessionState(t *testing.T) {
+	dir := t.TempDir()
+	blockedParent := filepath.Join(dir, "not-a-directory")
+	if err := os.WriteFile(blockedParent, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	credPath := filepath.Join(dir, "credentials.json")
+	contextPath := filepath.Join(dir, "context.json")
+	bot := New(Options{
+		AccountID:        "bot-1",
+		CredPath:         credPath,
+		ContextTokenPath: contextPath,
+		CursorPath:       filepath.Join(dir, "cursor.json"),
+		ReplayPath:       filepath.Join(dir, "replay.json"),
+		LogLevel:         "silent",
+	})
+	bot.reauthStore = store.NewReauthStore(filepath.Join(blockedParent, "marker.json"))
+	bot.creds = &auth.Credentials{Token: "invalid-token", AccountID: "bot-1", BaseURL: "https://api.example"}
+	if err := auth.SaveCredentials(bot.creds, credPath); err != nil {
+		t.Fatalf("seed credentials: %v", err)
+	}
+	if err := bot.contextTokens.Set("user-1", "stale-context"); err != nil {
+		t.Fatalf("seed context: %v", err)
+	}
+
+	err := bot.handleAuthenticatedError(&APIError{RetCode: -14, Message: "expired"})
+	var reauthErr *ReauthRequiredError
+	if !errors.As(err, &reauthErr) || reauthErr.CleanupErr == nil || !bot.ReauthRequired() {
+		t.Fatalf("marker failure did not remain fail-closed: %v", err)
+	}
+	if got := bot.contextTokens.Get("user-1"); got != "" {
+		t.Fatalf("best-effort context cleanup failed after marker error: %q", got)
+	}
+	if stored, loadErr := auth.LoadCredentials(credPath); loadErr != nil || stored != nil {
+		t.Fatalf("stale credentials survived marker error: %+v, %v", stored, loadErr)
+	}
+
+	restarted := New(Options{
+		AccountID:        "bot-1",
+		CredPath:         credPath,
+		ContextTokenPath: contextPath,
+		CursorPath:       filepath.Join(dir, "restart-cursor.json"),
+		ReplayPath:       filepath.Join(dir, "restart-replay.json"),
+		LogLevel:         "silent",
+	})
+	restarted.client.HTTP = &http.Client{Transport: rootRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("fresh QR required")
+	})}
+	if creds, loginErr := restarted.Login(context.Background(), false); creds != nil || loginErr == nil {
+		t.Fatalf("restart recovered invalid credentials: %+v, %v", creds, loginErr)
+	}
+}
+
+func TestDurableReauthenticationRejectsSameTokenFingerprint(t *testing.T) {
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "credentials.json")
+	contextPath := filepath.Join(dir, "context.json")
+	marker := store.NewReauthStore(store.ReauthStatePath(credPath))
+	if err := marker.Mark(store.ReauthRecord{
+		InvalidTokenSHA256: tokenSHA256("invalid-token"),
+		AccountID:          "bot-1",
+		ContextPaths:       []string{contextPath},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bot := New(Options{
+		AccountID:        "bot-1",
+		CredPath:         credPath,
+		ContextTokenPath: contextPath,
+		CursorPath:       filepath.Join(dir, "cursor.json"),
+		ReplayPath:       filepath.Join(dir, "replay.json"),
+		LogLevel:         "silent",
+	})
+	bot.client.HTTP = reauthenticationTestClient(rootRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("unexpected request: %s", req.URL.Path)
+	}), "invalid-token", "bot-1", "https://fresh.example")
+
+	creds, err := bot.Reauthenticate(context.Background())
+	if creds != nil || !errors.Is(err, auth.ErrInvalidatedCredential) || !errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("same-token durable reauthentication = %+v, %v", creds, err)
+	}
+	if !bot.ReauthRequired() {
+		t.Fatal("same-token response cleared the durable marker")
+	}
+	if stored, loadErr := auth.LoadCredentials(credPath); loadErr != nil || stored != nil {
+		t.Fatalf("same-token candidate remained persisted: %+v, %v", stored, loadErr)
+	}
+}
+
+func TestReauthenticationMarkerRemovalFailureDoesNotPublishSession(t *testing.T) {
+	bot, paths := newAuthenticatedSessionTestBot(t, "https://old.example")
+	if err := bot.handleAuthenticatedError(&APIError{RetCode: -14, Message: "expired"}); !errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("invalidate: %v", err)
+	}
+	bot.reauthStore = &clearFailingReauthPersistence{reauthPersistence: bot.reauthStore}
+	bot.client.HTTP = &http.Client{Transport: rootRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body := `{"qrcode":"qr","qrcode_img_content":"https://example.com/qr"}`
+		if req.URL.Path == "/ilink/bot/get_qrcode_status" {
+			body = `{"status":"confirmed","bot_token":"fresh-token","ilink_bot_id":"bot-1","ilink_user_id":"user-1","baseurl":"https://fresh.example"}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})}
+
+	creds, err := bot.Reauthenticate(context.Background())
+	if creds != nil || !errors.Is(err, ErrReauthRequired) || !bot.ReauthRequired() {
+		t.Fatalf("marker removal failure published session: %+v, %v", creds, err)
+	}
+	if stored, loadErr := auth.LoadCredentials(paths.credentials); loadErr != nil || stored != nil {
+		t.Fatalf("fresh credentials survived failed marker removal: %+v, %v", stored, loadErr)
+	}
+}
+
+func TestDurableReauthenticationRejectsConfiguredAccountMismatch(t *testing.T) {
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "credentials.json")
+	marker := store.NewReauthStore(store.ReauthStatePath(credPath))
+	if err := marker.Mark(store.ReauthRecord{
+		InvalidTokenSHA256: tokenSHA256("invalid-token"),
+		AccountID:          "bot-a",
+		ContextPaths:       []string{filepath.Join(dir, "bot-a-context.json")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bot := New(Options{
+		AccountID:        "bot-b",
+		CredPath:         credPath,
+		ContextTokenPath: filepath.Join(dir, "bot-b-context.json"),
+		CursorPath:       filepath.Join(dir, "cursor.json"),
+		ReplayPath:       filepath.Join(dir, "replay.json"),
+		LogLevel:         "silent",
+	})
+	var requests atomic.Int32
+	bot.client.HTTP = &http.Client{Transport: rootRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, errors.New("unexpected network request")
+	})}
+
+	if creds, err := bot.Reauthenticate(context.Background()); creds != nil || !errors.Is(err, ErrReauthRequired) || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("configured account mismatch = %+v, %v", creds, err)
+	}
+	if requests.Load() != 0 || !bot.ReauthRequired() {
+		t.Fatalf("configured mismatch requests=%d required=%v", requests.Load(), bot.ReauthRequired())
+	}
+	record, err := marker.Load()
+	if err != nil || record == nil || record.AccountID != "bot-a" {
+		t.Fatalf("configured mismatch rewrote marker: %+v, %v", record, err)
+	}
+}
+
+type clearFailingReauthPersistence struct {
+	reauthPersistence
+}
+
+func (*clearFailingReauthPersistence) Clear() error {
+	return errors.New("injected marker removal failure")
+}
+
+func TestLoginRejectsCollidingStatePathsBeforeNetwork(t *testing.T) {
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "credentials.json")
+	tests := []struct {
+		name        string
+		contextPath string
+	}{
+		{name: "credentials", contextPath: filepath.Join(dir, "nested", "..", "credentials.json")},
+		{name: "marker", contextPath: store.ReauthStatePath(credPath)},
+	}
+	if runtime.GOOS == "windows" {
+		tests = append(tests, struct {
+			name        string
+			contextPath string
+		}{name: "windows-case", contextPath: strings.ToUpper(credPath)})
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bot := New(Options{
+				AccountID:        "bot-1",
+				CredPath:         credPath,
+				ContextTokenPath: tc.contextPath,
+				CursorPath:       filepath.Join(dir, tc.name+"-cursor.json"),
+				ReplayPath:       filepath.Join(dir, tc.name+"-replay.json"),
+				LogLevel:         "silent",
+			})
+			var requests atomic.Int32
+			bot.client.HTTP = &http.Client{Transport: rootRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				requests.Add(1)
+				return nil, errors.New("unexpected network request")
+			})}
+			if creds, err := bot.Login(context.Background(), false); creds != nil || err == nil || !strings.Contains(err.Error(), "state paths must be distinct") {
+				t.Fatalf("colliding path Login = %+v, %v", creds, err)
+			}
+			if requests.Load() != 0 {
+				t.Fatalf("colliding path made %d requests", requests.Load())
+			}
+		})
+	}
+}
+
+func TestMalformedReauthenticationMarkerCanBeRepairedExplicitly(t *testing.T) {
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "credentials.json")
+	contextPath := filepath.Join(dir, "context.json")
+	markerPath := store.ReauthStatePath(credPath)
+	if err := auth.SaveCredentials(&auth.Credentials{Token: "invalid-token", AccountID: "bot-1", UserID: "user-1"}, credPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.NewContextStore("", contextPath).Set("user-1", "stale-context"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath, []byte("malformed"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bot := New(Options{AccountID: "bot-1", CredPath: credPath, ContextTokenPath: contextPath, LogLevel: "silent"})
+	var requests atomic.Int32
+	bot.client.HTTP = &http.Client{Transport: rootRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requests.Add(1)
+		return nil, fmt.Errorf("unexpected Login request: %s", req.URL.Path)
+	})}
+	if _, err := bot.Login(context.Background(), false); !errors.Is(err, ErrReauthRequired) {
+		t.Fatalf("Login with malformed marker = %v", err)
+	}
+	if !bot.ReauthRequired() || requests.Load() != 0 {
+		t.Fatalf("malformed marker state=%v requests=%d", bot.ReauthRequired(), requests.Load())
+	}
+	if record, err := store.NewReauthStore(markerPath).Load(); err != nil || record == nil || record.InvalidTokenSHA256 != tokenSHA256("invalid-token") {
+		t.Fatalf("repaired marker = %+v, %v", record, err)
+	}
+
+	bot.client.HTTP = reauthenticationTestClient(rootRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("unexpected request: %s", req.URL.Path)
+	}), "fresh-token", "bot-1", "https://fresh.example")
+	if creds, err := bot.Reauthenticate(context.Background()); err != nil || creds.Token != "fresh-token" {
+		t.Fatalf("explicit repair Reauthenticate = %+v, %v", creds, err)
 	}
 }
 

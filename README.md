@@ -89,6 +89,9 @@ Handler 返回 `RetryMessage(err)` 时，当前消息的重放键与所在批次
 封锁当前健康会话，且旧 Run/Handler 不能使用新凭证发送或复活旧 `context_token`；已经明确 Ack/Drop 的
 投递仍按原语义提交。需要启动新认证流程的并发或回调内重入请求会返回
 `ErrLoginInProgress`；属于旧会话的后续操作返回 `ErrSessionChanged`，不表示当前会话仍需扫码。
+失效转换会先持久化 `<CredPath>.reauth.json` marker；进程重启后，普通 `Login(false)` 仍会零网络请求地返回
+`ErrReauthRequired`。只有 fresh credentials 已持久化且所有记录的 `context_token` 已清空后，marker 才会被移除。
+迁移自定义状态目录时应将 credentials 与该 sidecar 作为同一状态集；marker 活跃期间不应直接降级到不识别它的 SDK 版本。
 
 ## 文档
 

@@ -67,6 +67,7 @@ type Bot struct {
 	contextTokens      *store.ContextStore
 	cursorStore        *store.CursorStore
 	replayStore        *store.ReplayStore
+	reauthStore        reauthPersistence
 	running            bool
 	mu                 sync.Mutex
 	loginMu            sync.Mutex
@@ -75,6 +76,14 @@ type Bot struct {
 	cancelPoll         context.CancelFunc
 	hooks              LifecycleHooks
 	logger             loggerAdapter
+}
+
+type reauthPersistence interface {
+	Path() string
+	Load() (*store.ReauthRecord, error)
+	Mark(store.ReauthRecord) error
+	Clear() error
+	Required() bool
 }
 
 // New creates a new Bot instance.
@@ -98,6 +107,10 @@ func New(opts ...Options) *Bot {
 	if o.ReplayPath == "" && o.AccountID != "" {
 		o.ReplayPath = filepath.Join(store.AccountStateDir(o.AccountID), "replay_dedupe.json")
 	}
+	reauthCredentialPath := o.CredPath
+	if reauthCredentialPath == "" {
+		reauthCredentialPath = auth.DefaultCredPath()
+	}
 	client := protocol.NewClient()
 	client.BotAgent = protocol.SanitizeBotAgent(o.BotAgent)
 	client.RouteTag = o.RouteTag
@@ -115,12 +128,15 @@ func New(opts ...Options) *Bot {
 		contextTokens: store.NewContextStore(o.AccountID, o.ContextTokenPath),
 		cursorStore:   store.NewCursorStore(o.AccountID, o.CursorPath),
 		replayStore:   store.NewReplayStore(o.AccountID, o.ReplayPath, store.DefaultReplayTTL),
+		reauthStore:   store.NewReauthStore(store.ReauthStatePath(reauthCredentialPath)),
 		hooks:         LifecycleHooks{},
 		logger:        logger,
 	}
 }
 
-// Login performs QR code login or loads stored credentials.
+// Login performs QR code login or loads stored credentials. A durable
+// reauthentication marker makes a non-forced login fail with
+// ErrReauthRequired without starting network authentication.
 func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 	if force {
 		return b.Reauthenticate(ctx)
@@ -139,6 +155,12 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 		return nil, ErrLoginInProgress
 	}
 	defer b.loginMu.Unlock()
+	if err := b.validateCurrentStatePaths(); err != nil {
+		return nil, err
+	}
+	if err := b.restoreDurableReauthentication(); err != nil {
+		return nil, err
+	}
 	if err := b.reauthError(); err != nil {
 		return nil, err
 	}
@@ -152,12 +174,19 @@ func (b *Bot) Login(ctx context.Context, force bool) (*Credentials, error) {
 }
 
 // Reauthenticate explicitly performs a fresh QR login without offering or
-// accepting credentials that were invalidated by a -14 response.
+// accepting credentials that were invalidated by a -14 response. It is the
+// only login path that can complete a durable reauthentication transition.
 func (b *Bot) Reauthenticate(ctx context.Context) (*Credentials, error) {
 	if !b.loginMu.TryLock() {
 		return nil, ErrLoginInProgress
 	}
 	defer b.loginMu.Unlock()
+	if err := b.validateCurrentStatePaths(); err != nil {
+		return nil, err
+	}
+	if err := b.restoreDurableReauthentication(); err != nil {
+		return nil, err
+	}
 
 	state, err := b.prepareReauthentication()
 	if err != nil {
@@ -188,6 +217,10 @@ func (b *Bot) login(ctx context.Context, force bool, reauth *reauthState) (*Cred
 	if err != nil {
 		return nil, reauthenticationAttemptError(reauth, err)
 	}
+	if reauth != nil && reauth.rejectsToken(creds.Token) {
+		cleanupErr := auth.ClearCredentials(b.opts.CredPath)
+		return nil, reauthenticationAttemptError(reauth, errors.Join(auth.ErrInvalidatedCredential, cleanupErr))
+	}
 	if expectedAccountID != "" && creds.AccountID != expectedAccountID {
 		cleanupErr := auth.ClearCredentials(b.opts.CredPath)
 		return nil, reauthenticationAttemptError(reauth, errors.Join(
@@ -207,18 +240,28 @@ func (b *Bot) login(ctx context.Context, force bool, reauth *reauthState) (*Cred
 	contextTokens := b.contextTokens
 	cursorStore := b.cursorStore
 	replayStore := b.replayStore
-	if reauth == nil && b.opts.ContextTokenPath == "" {
+	if b.opts.ContextTokenPath == "" && (reauth == nil || b.opts.AccountID == "") {
 		contextTokens = store.NewContextStore(accountID, "")
 	}
-	if reauth == nil && b.opts.CursorPath == "" {
+	if b.opts.CursorPath == "" && (reauth == nil || b.opts.AccountID == "") {
 		cursorStore = store.NewCursorStore(accountID, "")
 	}
-	if reauth == nil && b.opts.ReplayPath == "" {
+	if b.opts.ReplayPath == "" && (reauth == nil || b.opts.AccountID == "") {
 		replayStore = store.NewReplayStore(accountID, "", store.DefaultReplayTTL)
+	}
+	if err := b.validateStatePaths(contextTokens, cursorStore, replayStore); err != nil {
+		cleanupErr := auth.ClearCredentials(b.opts.CredPath)
+		return nil, reauthenticationAttemptError(reauth, errors.Join(err, cleanupErr))
+	}
+	if reauth != nil {
+		if err := b.validateReauthenticationContextPaths(reauth.contextPaths, cursorStore, replayStore); err != nil {
+			cleanupErr := auth.ClearCredentials(b.opts.CredPath)
+			return nil, reauthenticationAttemptError(reauth, errors.Join(err, cleanupErr))
+		}
 	}
 	b.sessionMu.Lock()
 	if force {
-		if err := contextTokens.Clear(); err != nil {
+		if err := b.persistAndClearReauthenticationContexts(reauth, contextTokens); err != nil {
 			b.sessionMu.Unlock()
 			cleanupErr := auth.ClearCredentials(b.opts.CredPath)
 			return nil, reauthenticationAttemptError(reauth, errors.Join(fmt.Errorf("clear context tokens for reauthentication: %w", err), cleanupErr))
@@ -240,6 +283,15 @@ func (b *Bot) login(ctx context.Context, force bool, reauth *reauthState) (*Cred
 			waitReauthState(currentReauth),
 			cleanupErr,
 		))
+	}
+	if reauth != nil {
+		if err := b.reauthStore.Clear(); err != nil {
+			b.mu.Unlock()
+			b.requestMu.Unlock()
+			b.sessionMu.Unlock()
+			cleanupErr := auth.ClearCredentials(b.opts.CredPath)
+			return nil, reauthenticationAttemptError(reauth, errors.Join(fmt.Errorf("clear durable reauthentication marker: %w", err), cleanupErr))
+		}
 	}
 	nextGeneration := b.sessionGeneration + 1
 	nextSessionContext, cancelNextSession := context.WithCancel(context.Background())
