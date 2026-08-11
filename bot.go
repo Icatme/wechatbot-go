@@ -1135,6 +1135,9 @@ func (b *Bot) parseMessage(wire *WireMessage) *IncomingMessage {
 		Text:         extractText(wire.ItemList),
 		Type:         detectType(wire.ItemList),
 		Timestamp:    time.UnixMilli(wire.CreateTimeMs),
+		SessionID:    wire.SessionID,
+		GroupID:      wire.GroupID,
+		RunID:        wire.RunID,
 		Raw:          wire,
 		ContextToken: wire.ContextToken,
 	}
@@ -1306,21 +1309,23 @@ func newDefaultLogger(level string) loggerAdapter {
 }
 
 func detectType(items []MessageItem) ContentType {
-	if len(items) == 0 {
-		return ContentText
+	for _, item := range items {
+		switch item.Type {
+		case ItemImage:
+			return ContentImage
+		case ItemVoice:
+			return ContentVoice
+		case ItemFile:
+			return ContentFile
+		case ItemVideo:
+			return ContentVideo
+		case ItemToolCallStart:
+			return ContentToolCallStart
+		case ItemToolCallResult:
+			return ContentToolCallResult
+		}
 	}
-	switch items[0].Type {
-	case ItemImage:
-		return ContentImage
-	case ItemVoice:
-		return ContentVoice
-	case ItemFile:
-		return ContentFile
-	case ItemVideo:
-		return ContentVideo
-	default:
-		return ContentText
-	}
+	return ContentText
 }
 
 func extractText(items []MessageItem) string {

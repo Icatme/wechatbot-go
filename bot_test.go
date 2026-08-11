@@ -106,6 +106,46 @@ func TestDetectTypeVideo(t *testing.T) {
 	}
 }
 
+func TestDetectTypeToolCalls(t *testing.T) {
+	if got := detectType([]MessageItem{{Type: ItemToolCallStart}}); got != ContentToolCallStart {
+		t.Fatalf("tool start type = %q", got)
+	}
+	if got := detectType([]MessageItem{{Type: ItemToolCallResult}}); got != ContentToolCallResult {
+		t.Fatalf("tool result type = %q", got)
+	}
+}
+
+func TestDetectTypeUsesFirstRecognizedNonTextItem(t *testing.T) {
+	tests := []struct {
+		name  string
+		items []MessageItem
+		want  ContentType
+	}{
+		{
+			name:  "text caption before image",
+			items: []MessageItem{{Type: ItemText}, {Type: ItemImage}},
+			want:  ContentImage,
+		},
+		{
+			name:  "unknown item before tool result",
+			items: []MessageItem{{Type: ItemText}, {Type: 99}, {Type: ItemToolCallResult}},
+			want:  ContentToolCallResult,
+		},
+		{
+			name:  "first non-text item remains primary",
+			items: []MessageItem{{Type: ItemVoice}, {Type: ItemVideo}},
+			want:  ContentVoice,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := detectType(tc.items); got != tc.want {
+				t.Fatalf("detectType() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDetectTypeEmpty(t *testing.T) {
 	if detectType(nil) != ContentText {
 		t.Fatal("expected text for empty items")
@@ -440,8 +480,100 @@ func TestTypesEnumValues(t *testing.T) {
 	if MessageStateNew != 0 || MessageStateGenerating != 1 || MessageStateFinish != 2 {
 		t.Fatal("MessageState enum mismatch")
 	}
-	if ItemText != 1 || ItemImage != 2 || ItemVoice != 3 || ItemFile != 4 || ItemVideo != 5 {
+	if ItemText != 1 || ItemImage != 2 || ItemVoice != 3 || ItemFile != 4 || ItemVideo != 5 || ItemToolCallStart != 11 || ItemToolCallResult != 12 {
 		t.Fatal("MessageItemType enum mismatch")
+	}
+}
+
+func TestToolCallMessageItemJSON(t *testing.T) {
+	completed := false
+	start := MessageItem{
+		Type:         ItemToolCallStart,
+		CreateTimeMs: 1700000000000,
+		IsCompleted:  &completed,
+		MsgID:        "item-1",
+		ToolCallStartItem: &ToolCallStartItem{
+			ToolName:   "search",
+			ToolCallID: "call-1",
+		},
+	}
+	raw, err := json.Marshal(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"type":11,"create_time_ms":1700000000000,"is_completed":false,"msg_id":"item-1","tool_call_start_item":{"tool_name":"search","tool_call_id":"call-1"}}`
+	if string(raw) != want {
+		t.Fatalf("tool start JSON = %s, want %s", raw, want)
+	}
+
+	completed = true
+	result := MessageItem{
+		Type:         ItemToolCallResult,
+		CreateTimeMs: 1700000001000,
+		UpdateTimeMs: 1700000002000,
+		IsCompleted:  &completed,
+		ToolCallResultItem: &ToolCallResultItem{
+			ToolName:   "search",
+			ToolCallID: "call-1",
+			Status:     "completed",
+		},
+	}
+	raw, err = json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded MessageItem
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ToolCallResultItem == nil || decoded.ToolCallResultItem.Status != "completed" || decoded.IsCompleted == nil || !*decoded.IsCompleted {
+		t.Fatalf("tool result round trip = %+v", decoded)
+	}
+}
+
+func TestWireMessageAgentCorrelationFields(t *testing.T) {
+	wire := WireMessage{
+		MessageID:    42,
+		UpdateTimeMs: 1700000001000,
+		DeleteTimeMs: 1700000002000,
+		SessionID:    "session-1",
+		GroupID:      "group-1",
+		RunID:        "run-1",
+	}
+	raw, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded WireMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.SessionID != wire.SessionID || decoded.GroupID != wire.GroupID || decoded.RunID != wire.RunID || decoded.UpdateTimeMs != wire.UpdateTimeMs || decoded.DeleteTimeMs != wire.DeleteTimeMs {
+		t.Fatalf("agent correlation round trip = %+v", decoded)
+	}
+}
+
+func TestParseMessagePropagatesAgentCorrelationFields(t *testing.T) {
+	bot := New()
+	wire := &WireMessage{
+		FromUserID:  "user-1",
+		MessageType: MessageTypeUser,
+		SessionID:   "session-1",
+		GroupID:     "group-1",
+		RunID:       "run-1",
+		ItemList: []MessageItem{
+			{Type: ItemToolCallStart, ToolCallStartItem: &ToolCallStartItem{ToolName: "search", ToolCallID: "call-1"}},
+		},
+	}
+	msg := bot.parseMessage(wire)
+	if msg == nil {
+		t.Fatal("expected parsed message")
+	}
+	if msg.SessionID != wire.SessionID || msg.GroupID != wire.GroupID || msg.RunID != wire.RunID {
+		t.Fatalf("correlation fields = session %q group %q run %q", msg.SessionID, msg.GroupID, msg.RunID)
+	}
+	if msg.Type != ContentToolCallStart {
+		t.Fatalf("content type = %q, want %q", msg.Type, ContentToolCallStart)
 	}
 }
 
