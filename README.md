@@ -79,7 +79,7 @@ Handler 返回 `RetryMessage(err)` 时，当前消息的重放键与所在批次
 默认最多同时处理 4 个用户，可通过 `Options.MaxConcurrentHandlers` 调整（最大 256，设为 `1` 可全局串行）。
 同一个 Handler、Middleware 与 `AfterReceive` Hook 可能被不同用户并发调用，因此实现必须并发安全。全局轮询游标只会
 推进到连续完成的批次前缀；缺少 `message_id`、`client_id` 和 `seq` 的消息仍属于 at-least-once 投递。
-重放去重还依赖同一消息身份始终对应同一用户；若上游返回身份相同但用户不同的消息，不提供 exactly-once 保证。
+重放键按对端用户隔离，不同会话可安全复用相同的 `message_id`、`client_id` 或 `seq`。
 
 ## 文档
 
