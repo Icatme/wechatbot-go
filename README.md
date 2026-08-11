@@ -46,9 +46,12 @@ func main() {
         os.Exit(1)
     }
 
-    bot.OnMessage(func(msg *wechatbot.IncomingMessage) {
-        _ = bot.Reply(ctx, msg, fmt.Sprintf("Echo: %s", msg.Text))
-    })
+    bot.Handle(wechatbot.MessageHandlerFunc(func(ctx context.Context, msg *wechatbot.IncomingMessage) wechatbot.MessageResult {
+        if err := bot.Reply(ctx, msg, fmt.Sprintf("Echo: %s", msg.Text)); err != nil {
+            return wechatbot.RetryMessage(err)
+        }
+        return wechatbot.AckMessage()
+    }))
 
     _ = bot.Run(ctx)
 }
@@ -61,6 +64,7 @@ func main() {
 - 扫码登录 + 凭证持久化
 - 长轮询接收消息
 - 轮询与消息处理解耦，保持消息处理顺序
+- Handler 接收运行上下文，并以 Ack / Retry / Drop 明确控制投递结果
 - 按会话持久化 `message_id` / `client_id` / `seq` 全部身份别名，避免跨用户误判重放
 - 消息解码失败时默认停止消费并保留 cursor，避免静默丢消息
 - 文本 / 图片 / 文件 / 视频 / 语音 收发
@@ -68,6 +72,9 @@ func main() {
 - context_token 自动管理
 - 输入状态指示器
 - 会话过期（`-14`）自动恢复
+
+Handler 返回 `RetryMessage(err)` 时，当前消息的重放键与所在批次游标不会提交，`Run` 会携带该错误退出；
+返回 `DropMessage(reason)` 会明确消费该消息。`Stop` 和传给 `Run` 的 context 会传播到 Handler，Handler 应及时响应取消。
 
 ## 文档
 

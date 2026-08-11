@@ -570,11 +570,12 @@ func TestReplayKeys(t *testing.T) {
 
 func TestProcessUpdateBatchRejectsMalformedMessageWithoutAdvancingCursor(t *testing.T) {
 	bot := newReplayTestBot(t)
+	handler := MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult { return AckMessage() })
 	if err := bot.cursorStore.Set("cursor-before"); err != nil {
 		t.Fatal(err)
 	}
 
-	err := bot.processUpdateBatch(context.Background(), updateBatch{
+	err := bot.processUpdateBatch(context.Background(), handler, updateBatch{
 		messages: []json.RawMessage{json.RawMessage(`{"message_id":"invalid"}`)},
 		cursor:   "cursor-after",
 	})
@@ -637,6 +638,7 @@ func TestRunRetriesMalformedMessageFromPersistedCursor(t *testing.T) {
 		}))
 
 		bot := New(opts)
+		bot.Handle(MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult { return AckMessage() }))
 		bot.client.HTTP = server.Client()
 		bot.creds = &auth.Credentials{BaseURL: server.URL, Token: "token", AccountID: "bot-1"}
 		err := bot.Run(context.Background())
@@ -672,11 +674,12 @@ func TestProcessUpdateBatchScopesIdentityByPeer(t *testing.T) {
 	bot := newReplayTestBot(t)
 
 	var handled atomic.Int32
-	bot.OnMessage(func(msg *IncomingMessage) {
+	handler := MessageHandlerFunc(func(ctx context.Context, msg *IncomingMessage) MessageResult {
 		handled.Add(1)
+		return AckMessage()
 	})
 
-	if err := bot.processUpdateBatch(context.Background(), updateBatch{
+	if err := bot.processUpdateBatch(context.Background(), handler, updateBatch{
 		messages: []json.RawMessage{
 			marshalWireMessage(t, WireMessage{
 				MessageID:   42,
@@ -695,7 +698,6 @@ func TestProcessUpdateBatchScopesIdentityByPeer(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("process batch: %v", err)
 	}
-
 	if got := handled.Load(); got != 2 {
 		t.Fatalf("handler called %d times, want 2", got)
 	}
@@ -713,8 +715,9 @@ func TestProcessUpdateBatchDeduplicatesAnyCommittedAlias(t *testing.T) {
 	bot := newReplayTestBot(t)
 
 	var handled atomic.Int32
-	bot.OnMessage(func(msg *IncomingMessage) {
+	handler := MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult {
 		handled.Add(1)
+		return AckMessage()
 	})
 	messages := []WireMessage{
 		{
@@ -739,7 +742,7 @@ func TestProcessUpdateBatchDeduplicatesAnyCommittedAlias(t *testing.T) {
 		},
 	}
 	for i, wire := range messages {
-		if err := bot.processUpdateBatch(context.Background(), updateBatch{
+		if err := bot.processUpdateBatch(context.Background(), handler, updateBatch{
 			messages: []json.RawMessage{marshalWireMessage(t, wire)},
 			cursor:   "cursor-" + strconv.Itoa(i+1),
 		}); err != nil {
@@ -764,8 +767,9 @@ func TestProcessUpdateBatchPrefersMessageIDOverCollidingFallbackAliases(t *testi
 	bot := newReplayTestBot(t)
 
 	var handled atomic.Int32
-	bot.OnMessage(func(msg *IncomingMessage) {
+	handler := MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult {
 		handled.Add(1)
+		return AckMessage()
 	})
 	messages := []WireMessage{
 		{
@@ -794,7 +798,7 @@ func TestProcessUpdateBatchPrefersMessageIDOverCollidingFallbackAliases(t *testi
 		},
 	}
 	for i, wire := range messages {
-		if err := bot.processRawMessage(marshalWireMessage(t, wire)); err != nil {
+		if err := bot.processRawMessage(context.Background(), handler, marshalWireMessage(t, wire)); err != nil {
 			t.Fatalf("delivery %d failed: %v", i+1, err)
 		}
 	}
@@ -818,8 +822,9 @@ func TestProcessUpdateBatchKeepsAtLeastOnceWithoutIdentityOrPeer(t *testing.T) {
 	bot := newReplayTestBot(t)
 
 	var handled atomic.Int32
-	bot.OnMessage(func(msg *IncomingMessage) {
+	handler := MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult {
 		handled.Add(1)
+		return AckMessage()
 	})
 	messages := []WireMessage{
 		{FromUserID: "user-1", ToUserID: "bot-1", MessageType: MessageTypeUser},
@@ -830,7 +835,7 @@ func TestProcessUpdateBatchKeepsAtLeastOnceWithoutIdentityOrPeer(t *testing.T) {
 			t.Fatalf("replayKeys(%+v) = %q, want no keys", wire, keys)
 		}
 		for delivery := 0; delivery < 2; delivery++ {
-			if err := bot.processRawMessage(marshalWireMessage(t, wire)); err != nil {
+			if err := bot.processRawMessage(context.Background(), handler, marshalWireMessage(t, wire)); err != nil {
 				t.Fatalf("process message: %v", err)
 			}
 		}
@@ -901,13 +906,14 @@ func TestRunContinuesPollingBeforeHandlerCompletes(t *testing.T) {
 
 	handlerStarted := make(chan struct{}, 1)
 	releaseHandler := make(chan struct{})
-	bot.OnMessage(func(msg *IncomingMessage) {
+	bot.Handle(MessageHandlerFunc(func(ctx context.Context, msg *IncomingMessage) MessageResult {
 		select {
 		case handlerStarted <- struct{}{}:
 		default:
 		}
 		<-releaseHandler
-	})
+		return AckMessage()
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

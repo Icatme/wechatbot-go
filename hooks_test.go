@@ -1,39 +1,69 @@
 package wechatbot
 
 import (
+	"context"
 	"errors"
+	"reflect"
 	"testing"
 )
 
 func TestMiddlewareStopsPipeline(t *testing.T) {
 	bot := New(Options{})
 	called := false
-	bot.Use(func(msg *IncomingMessage) bool {
-		return false
-	})
-	bot.OnMessage(func(msg *IncomingMessage) {
+	bot.Handle(MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult {
 		called = true
+		return AckMessage()
+	}))
+	bot.Use(func(MessageHandler) MessageHandler {
+		return MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult {
+			return DropMessage(errors.New("filtered"))
+		})
 	})
-	bot.runMiddleware(&IncomingMessage{})
+
+	handler, err := bot.configuredHandler()
+	if err != nil {
+		t.Fatalf("configure handler: %v", err)
+	}
+	result := handler.HandleMessage(context.Background(), &IncomingMessage{})
+	if result.Action != MessageDrop {
+		t.Fatalf("middleware action = %d, want drop", result.Action)
+	}
 	if called {
-		t.Fatal("handler should not be called when middleware returns false")
+		t.Fatal("handler should not be called when middleware drops the message")
 	}
 }
 
-func TestMiddlewareAllowsPipeline(t *testing.T) {
+func TestMiddlewareRegistrationOrder(t *testing.T) {
 	bot := New(Options{})
-	called := false
-	bot.Use(func(msg *IncomingMessage) bool {
-		return true
-	})
-	bot.OnMessage(func(msg *IncomingMessage) {
-		called = true
-	})
-	if !bot.runMiddleware(&IncomingMessage{}) {
-		t.Fatal("middleware should allow message")
+	var calls []string
+	bot.Handle(MessageHandlerFunc(func(context.Context, *IncomingMessage) MessageResult {
+		calls = append(calls, "handler")
+		return AckMessage()
+	}))
+	register := func(name string) {
+		bot.Use(func(next MessageHandler) MessageHandler {
+			return MessageHandlerFunc(func(ctx context.Context, msg *IncomingMessage) MessageResult {
+				calls = append(calls, name+":before")
+				result := next.HandleMessage(ctx, msg)
+				calls = append(calls, name+":after")
+				return result
+			})
+		})
 	}
-	if called {
-		t.Fatal("runMiddleware should not invoke handlers")
+	register("first")
+	register("second")
+
+	handler, err := bot.configuredHandler()
+	if err != nil {
+		t.Fatalf("configure handler: %v", err)
+	}
+	result := handler.HandleMessage(context.Background(), &IncomingMessage{})
+	if result.Action != MessageAck {
+		t.Fatalf("middleware action = %d, want ack", result.Action)
+	}
+	want := []string{"first:before", "second:before", "handler", "second:after", "first:after"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
 	}
 }
 
@@ -59,10 +89,10 @@ func TestHookRegistryRun(t *testing.T) {
 func TestHookRegistryStopsOnError(t *testing.T) {
 	var registry HookRegistry[int]
 	called := false
-	registry.Register(func(n int) error {
+	registry.Register(func(int) error {
 		return errors.New("stop")
 	})
-	registry.Register(func(n int) error {
+	registry.Register(func(int) error {
 		called = true
 		return nil
 	})

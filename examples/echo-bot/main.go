@@ -32,16 +32,17 @@ func main() {
 	fmt.Printf("Logged in: %s (%s)\n", creds.AccountID, creds.UserID)
 
 	count := 0
-	bot.OnMessage(func(msg *wechatbot.IncomingMessage) {
+	bot.Handle(wechatbot.MessageHandlerFunc(func(ctx context.Context, msg *wechatbot.IncomingMessage) wechatbot.MessageResult {
 		count++
 		fmt.Printf("[%d] %s: %s\n", count, msg.UserID, msg.Text)
 
 		_ = bot.SendTyping(ctx, msg.UserID)
 
 		if err := bot.Reply(ctx, msg, fmt.Sprintf("Echo: %s", msg.Text)); err != nil {
-			fmt.Fprintf(os.Stderr, "Reply failed: %v\n", err)
+			return wechatbot.RetryMessage(err)
 		}
-	})
+		return wechatbot.AckMessage()
+	}))
 
 	fmt.Println("Listening for messages (Ctrl+C to stop)")
 	if err := bot.Run(ctx); err != nil {

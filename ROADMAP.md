@@ -170,7 +170,7 @@
 ### 5.1 Middleware / 发送钩子
 
 - **参考**：`wechatbot/nodejs/src/middleware/`
-- **目标**：为 `OnMessage` 增加中间件链；增加 `BeforeSend` / `AfterSend` 钩子。
+- **目标**：为 `Handle` / `MessageHandler` 增加中间件链；增加 `BeforeSend` / `AfterSend` 钩子。
 - **验收**：可注册 filter/rate-limit 中间件。
 
 ### 5.2 Slash 命令
