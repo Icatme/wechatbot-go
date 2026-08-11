@@ -596,14 +596,6 @@ func TestCategorizeByExtension(t *testing.T) {
 	}
 }
 
-func TestCdnMediaMap(t *testing.T) {
-	m := &CDNMedia{EncryptQueryParam: "param=1", AESKey: "key123", EncryptType: 1}
-	d := cdnMediaMap(m)
-	if d["encrypt_query_param"] != "param=1" || d["aes_key"] != "key123" || d["encrypt_type"] != 1 {
-		t.Fatalf("unexpected cdnMediaMap result: %v", d)
-	}
-}
-
 func TestSendContentConstructors(t *testing.T) {
 	s := SendText("hello")
 	if s.Text != "hello" {

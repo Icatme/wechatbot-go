@@ -434,40 +434,20 @@ func BuildCDNUploadURL(cdnBaseURL, uploadParam, filekey string) string {
 	return cdnBaseURL + "/upload?encrypted_query_param=" + url.QueryEscape(uploadParam) + "&filekey=" + url.QueryEscape(filekey)
 }
 
-// BuildTextMessage creates a text message payload.
-func BuildTextMessage(userID, contextToken, text string) map[string]interface{} {
-	return map[string]interface{}{
+// BuildMessage creates one outbound message payload. The caller owns ClientID
+// generation so an uncertain send can be retried with the same identity.
+func BuildMessage(userID, contextToken, clientID, runID string, item interface{}) map[string]interface{} {
+	msg := map[string]interface{}{
 		"from_user_id":  "",
 		"to_user_id":    userID,
-		"client_id":     newUUID(),
+		"client_id":     clientID,
 		"message_type":  2,
 		"message_state": 2,
 		"context_token": contextToken,
-		"item_list": []map[string]interface{}{
-			{"type": 1, "text_item": map[string]string{"text": text}},
-		},
+		"item_list":     []interface{}{item},
 	}
-}
-
-// BuildMediaMessage creates a media message payload.
-func BuildMediaMessage(userID, contextToken string, itemList []map[string]interface{}) map[string]interface{} {
-	return map[string]interface{}{
-		"from_user_id":  "",
-		"to_user_id":    userID,
-		"client_id":     newUUID(),
-		"message_type":  2,
-		"message_state": 2,
-		"context_token": contextToken,
-		"item_list":     itemList,
+	if runID != "" {
+		msg["run_id"] = runID
 	}
-}
-
-func newUUID() string {
-	// Simple UUID v4
-	var buf [16]byte
-	rand.Read(buf[:])
-	buf[6] = (buf[6] & 0x0f) | 0x40
-	buf[8] = (buf[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+	return msg
 }

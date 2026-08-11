@@ -49,8 +49,10 @@ type LifecycleHooks struct {
 	AfterLogin HookRegistry[*Credentials]
 	// OnError runs when the bot encounters a non-fatal runtime error.
 	OnError HookRegistry[error]
-	// BeforeSend runs before a message is sent; mutate payload to change content.
-	BeforeSend HookRegistry[*SendContent]
+	// BeforeSend runs after ClientID generation and before a message is sent.
+	BeforeSend HookRegistry[*SendRequest]
+	// AfterSend observes the result of an attempted message send.
+	AfterSend HookRegistry[SendOutcome]
 	// AfterReceive runs after a message is parsed and before handlers run.
 	AfterReceive HookRegistry[*IncomingMessage]
 }

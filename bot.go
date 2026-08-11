@@ -795,9 +795,6 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 	if err := requireContextToken(userID, contextToken); err != nil {
 		return err
 	}
-	if err := b.hooks.BeforeSend.Run(&content); err != nil {
-		return fmt.Errorf("BeforeSend hook failed: %w", err)
-	}
 
 	// Text-only path.
 	if content.Text != "" {
@@ -826,17 +823,18 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		if err != nil {
 			return err
 		}
-		imageItem := map[string]interface{}{
-			"media":    cdnMediaMap(&result.Media),
-			"mid_size": result.EncryptedFileSize,
+		imageItem := &ImageItem{
+			Media:   &result.Media,
+			MidSize: int64(result.EncryptedFileSize),
 		}
 		if result.ThumbMedia.EncryptQueryParam != "" {
-			imageItem["thumb_media"] = cdnMediaMap(&result.ThumbMedia)
+			imageItem.ThumbMedia = &result.ThumbMedia
 		}
-		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
-			"type": 2, "image_item": imageItem,
+		_, err = b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+			Type:      ItemImage,
+			ImageItem: imageItem,
 		}})
-		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
+		return err
 	}
 
 	// Video
@@ -847,17 +845,18 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		if err != nil {
 			return err
 		}
-		videoItem := map[string]interface{}{
-			"media":      cdnMediaMap(&result.Media),
-			"video_size": result.EncryptedFileSize,
+		videoItem := &VideoItem{
+			Media:     &result.Media,
+			VideoSize: int64(result.EncryptedFileSize),
 		}
 		if result.ThumbMedia.EncryptQueryParam != "" {
-			videoItem["thumb_media"] = cdnMediaMap(&result.ThumbMedia)
+			videoItem.ThumbMedia = &result.ThumbMedia
 		}
-		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
-			"type": 5, "video_item": videoItem,
+		_, err = b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+			Type:      ItemVideo,
+			VideoItem: videoItem,
 		}})
-		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
+		return err
 	}
 
 	// File (auto-route by extension)
@@ -878,14 +877,15 @@ func (b *Bot) sendContent(ctx context.Context, userID, contextToken string, cont
 		if err != nil {
 			return err
 		}
-		msg := protocol.BuildMediaMessage(userID, contextToken, []map[string]interface{}{{
-			"type": 4, "file_item": map[string]interface{}{
-				"media":     cdnMediaMap(&result.Media),
-				"file_name": fileName,
-				"len":       strconv.Itoa(len(content.File)),
+		_, err = b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+			Type: ItemFile,
+			FileItem: &FileItem{
+				Media:    &result.Media,
+				FileName: fileName,
+				Len:      strconv.Itoa(len(content.File)),
 			},
 		}})
-		return b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg)
+		return err
 	}
 
 	// Caption-only is valid: we already sent it above.
@@ -1045,14 +1045,6 @@ func (b *Bot) cdnUploadWithThumb(ctx context.Context, creds *auth.Credentials, d
 	return result, nil
 }
 
-func cdnMediaMap(m *CDNMedia) map[string]interface{} {
-	return map[string]interface{}{
-		"encrypt_query_param": m.EncryptQueryParam,
-		"aes_key":             m.AESKey,
-		"encrypt_type":        m.EncryptType,
-	}
-}
-
 const (
 	maxDownloadBytes = 100 * 1024 * 1024
 	maxTextChars     = 2000
@@ -1076,17 +1068,16 @@ func (b *Bot) sendText(ctx context.Context, userID, text, contextToken string) e
 	if err := requireContextToken(userID, contextToken); err != nil {
 		return err
 	}
-	creds, err := b.readyCreds()
-	if err != nil {
-		return err
-	}
 	if b.opts.StripMarkdown {
 		text = markdown.StripMarkdown(text)
 	}
 	chunks := chunkText(text, maxTextChars)
 	for _, chunk := range chunks {
-		msg := protocol.BuildTextMessage(userID, contextToken, chunk)
-		if err := b.client.SendMessage(ctx, creds.BaseURL, creds.Token, msg); err != nil {
+		_, err := b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+			Type:     ItemText,
+			TextItem: &TextItem{Text: chunk},
+		}})
+		if err != nil {
 			return err
 		}
 	}
@@ -1105,12 +1096,15 @@ func (b *Bot) notifyError(ctx context.Context, userID, contextToken string, err 
 	if b.sessionGuard.AssertActive() != nil {
 		return
 	}
-	creds := b.getCreds()
-	if creds == nil {
+	if b.getCreds() == nil {
 		return
 	}
 	msg := "⚠️ 消息发送失败，请稍后重试。"
-	if e := b.client.SendMessage(ctx, creds.BaseURL, creds.Token, protocol.BuildTextMessage(userID, contextToken, msg)); e != nil {
+	_, e := b.sendMessage(ctx, userID, contextToken, OutboundMessage{Item: MessageItem{
+		Type:     ItemText,
+		TextItem: &TextItem{Text: msg},
+	}})
+	if e != nil {
 		b.log("warn", "failed to send error notice: %v", e)
 	}
 }
