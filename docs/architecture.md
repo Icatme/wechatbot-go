@@ -132,13 +132,31 @@ python/
 ### Go
 
 ```
-golang/
-├── types.go                # All public types
-├── bot.go                  # Bot client
+wechatbot-go/
+├── bot.go                  # Options, Bot state, and construction
+├── login.go                # Login and credential installation
+├── session.go              # Session snapshots and authenticated request gate
+├── run.go                  # Long polling and inbound delivery lifecycle
+├── dispatcher.go           # Per-conversation ordered dispatch
+├── content.go              # High-level send/reply content routing
+├── outbound.go             # Stable outbound identity and send hooks
+├── media.go                # CDN upload and download
+├── message.go              # Inbound message parsing
+├── handler.go              # Handler and middleware pipeline
+├── reauth.go               # Fail-closed reauthentication state machine
+├── logging.go              # Logger adapters and error reporting
+├── types.go                # Public wire and message types
+├── errors.go               # Public errors
+├── hooks.go                # Lifecycle hooks
+├── slash.go                # Slash command registry
 ├── internal/
-│   ├── protocol/api.go     # iLink HTTP calls
-│   ├── auth/login.go       # QR login + credentials
-│   └── crypto/aes.go       # AES-128-ECB
+│   ├── protocol/           # iLink HTTP calls and wire envelopes
+│   ├── auth/               # QR login and credentials
+│   ├── config/             # Typing-ticket cache
+│   ├── crypto/             # AES-128-ECB
+│   ├── store/              # Durable context, cursor, replay, and reauth state
+│   └── ...                 # Remote media, persistence, markdown, thumbnails
+├── log/                    # Structured logging package
 └── examples/
     └── echo-bot/main.go
 ```

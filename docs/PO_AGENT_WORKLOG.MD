@@ -35,3 +35,7 @@
 - Bumped the SDK fallback protocol version to `0.4.0` and prepared the source-only Go module release after the reliable-delivery, Agent-envelope, outbound-identity, typed-error, and explicit-reauthentication stack merged to `main`.
 
 - Updated README for the `v0.4.0` delivery/session changes and migration notes; replaced promotional repository comparisons with neutral scope, provenance, and synchronization statements.
+
+## 2026-08-12
+
+- Split the 1,804-line root `bot.go` into same-package responsibility files for login, session gating, polling, content, media, message parsing, handlers, and logging; preserved declarations, public API, control flow, and lock ordering, and refreshed the documented Go file structure.
