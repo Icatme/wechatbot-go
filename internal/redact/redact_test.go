@@ -160,6 +160,91 @@ func TestStringRedactsSchemeLessAssignmentsBeforeDiagnostics(t *testing.T) {
 	}
 }
 
+func TestStringRedactsCompleteSensitiveAssignmentValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "double quoted value",
+			input: `password="correct horse battery staple" status=401`,
+			want:  "password=*** status=401",
+		},
+		{
+			name:  "comma in value",
+			input: "password=abc,def status=401",
+			want:  "password=*** status=401",
+		},
+		{
+			name:  "comma and equals in value",
+			input: "password=abc,def=secret status=401",
+			want:  "password=*** status=401",
+		},
+		{
+			name:  "semicolon in value",
+			input: "password=abc;def status=401",
+			want:  "password=*** status=401",
+		},
+		{
+			name:  "header value",
+			input: `password: "correct horse battery staple" status=401`,
+			want:  "password: *** status=401",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := String(test.input, nil); got != test.want {
+				t.Fatalf("String(%q) = %q, want %q", test.input, got, test.want)
+			}
+		})
+	}
+}
+
+func TestStringRedactsSchemeRelativeURL(t *testing.T) {
+	got := String("fetch //user:pass@proxy.example/%zz?signature=signed-secret status=502", nil)
+	for _, secret := range []string{"user", "pass", "signed-secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("scheme-relative URL leaked %q: %s", secret, got)
+		}
+	}
+	for _, diagnostic := range []string{"proxy.example/%zz", "status=502"} {
+		if !strings.Contains(got, diagnostic) {
+			t.Fatalf("scheme-relative URL lost %q: %s", diagnostic, got)
+		}
+	}
+}
+
+type credentialError struct {
+	message string
+}
+
+func (e *credentialError) Error() string { return e.message }
+
+func TestErrorDoesNotRetainUnsafeLeaf(t *testing.T) {
+	original := &credentialError{message: `password="correct horse battery staple"`}
+	got := Error(original)
+	if strings.Contains(got.Error(), "correct horse") {
+		t.Fatalf("sanitized error leaked credential: %v", got)
+	}
+	var credentialErr *credentialError
+	if errors.As(got, &credentialErr) || errors.Is(got, original) || errors.Unwrap(got) != nil {
+		t.Fatalf("sanitized error retained unsafe leaf: %#v", got)
+	}
+}
+
+func TestErrorPreservesSafeNestedCause(t *testing.T) {
+	cause := errors.New("connection refused")
+	original := fmt.Errorf(`password="correct horse battery staple": %w`, cause)
+	got := Error(original)
+	if strings.Contains(got.Error(), "correct horse") || !errors.Is(got, cause) {
+		t.Fatalf("sanitized error was unsafe or lost safe cause: %v", got)
+	}
+	if errors.Is(got, original) {
+		t.Fatal("sanitized error retained unsafe wrapper")
+	}
+}
+
 func TestErrorSanitizesURLErrorAndPreservesTraversal(t *testing.T) {
 	cause := errors.New("connection refused")
 	original := &url.Error{

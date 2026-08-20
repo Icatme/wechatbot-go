@@ -42,4 +42,4 @@
 
 ## 2026-08-20
 
-- Adapted upstream sensitive-data hardening to the Go SDK: centralized recursive and malformed-input redaction, capped upstream API error messages at 4 KiB of valid UTF-8, sanitized API/CDN/QR/remote-media network errors without losing safe typed traversal, and added focused leakage regressions.
+- Adapted upstream sensitive-data hardening to the Go SDK: centralized recursive and malformed-input redaction (including quoted/delimited credentials and authority-form URLs), capped upstream API error messages at 4 KiB of valid UTF-8, rebuilt unsafe error wrappers while preserving safe causes, and added API/CDN/QR/remote-media/log leakage regressions.

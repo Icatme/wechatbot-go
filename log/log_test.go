@@ -71,6 +71,27 @@ func TestLoggerRedactsNestedAndMalformedValues(t *testing.T) {
 	}
 }
 
+func TestLoggerRedactsDelimitedCredentialsAndSchemeRelativeURLs(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New(Options{Level: InfoLevel, Output: &buf})
+	logger.Info(
+		`request password="correct horse battery staple" status=401`,
+		F("detail", "password=abc,def status=401"),
+		F("proxy", "fetch //user:pass@proxy.example/%zz?signature=signed-secret status=502"),
+	)
+	out := buf.String()
+	for _, secret := range []string{"correct horse", "abc,def", "//user", ":pass@", "signed-secret"} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("log contains %q: %s", secret, out)
+		}
+	}
+	for _, diagnostic := range []string{"status=401", "status=502", "proxy.example/%zz"} {
+		if !strings.Contains(out, diagnostic) {
+			t.Fatalf("log lost %q: %s", diagnostic, out)
+		}
+	}
+}
+
 func TestLoggerOutputsJSON(t *testing.T) {
 	var buf bytes.Buffer
 	logger := New(Options{Level: InfoLevel, Output: &buf})

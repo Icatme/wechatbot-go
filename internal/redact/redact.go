@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/url"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -50,9 +51,10 @@ var (
 	}
 	authorizationAssignmentPrefixPattern = regexp.MustCompile(`(?i)((?:proxy[-_])?authorization)(\s*=\s*)`)
 	authorizationHeaderPattern           = regexp.MustCompile(`(?im)((?:proxy[-_])?authorization)([ \t]*:[ \t]*)[^\r\n]*`)
-	assignmentPattern                    = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(\s*=\s*)([^&\s,;]+)`)
-	headerPattern                        = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(\s*:\s*)([^\s,;]+)`)
+	assignmentPrefixPattern              = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(\s*=\s*)`)
+	headerPrefixPattern                  = regexp.MustCompile(`(?i)([a-z0-9_.-]+)(\s*:\s*)`)
 	urlPattern                           = regexp.MustCompile(`(?i)\b(?:https?|wss?)://[^\s"'<>]+`)
+	schemeRelativeURLPattern             = regexp.MustCompile(`//[^\s"'<>]+`)
 )
 
 // SensitiveKey reports whether a structured field name carries secret data.
@@ -146,9 +148,10 @@ func redactMalformedURLUserinfo(raw string) string {
 	return raw[:authorityStart] + replacement + "@" + raw[authorityStart+userinfo+1:]
 }
 
-// Error returns an error with a sanitized Error string while retaining the
-// original cause for errors.Is/errors.As traversal. URL errors are cloned with
-// a sanitized URL so errors.As exposes the safe form.
+// Error returns an error with a sanitized Error string. Safe causes remain
+// available to errors.Is/errors.As traversal, while unsafe wrappers are
+// rebuilt without retaining the original secret-bearing object. URL errors
+// are cloned with a sanitized URL so errors.As exposes the safe form.
 func Error(err error) error {
 	if err == nil {
 		return nil
@@ -172,10 +175,40 @@ func Error(err error) error {
 		return sanitizedError{message: message, cause: sanitizeURLError(urlErr)}
 	}
 	message := String(err.Error(), nil)
+	if causes, ok := err.(interface{ Unwrap() []error }); ok {
+		originalCauses := causes.Unwrap()
+		safeCauses := make([]error, 0, len(originalCauses))
+		changed := message != err.Error()
+		for _, cause := range originalCauses {
+			safeCause := Error(cause)
+			safeCauses = append(safeCauses, safeCause)
+			changed = changed || !sameError(safeCause, cause)
+		}
+		if !changed {
+			return err
+		}
+		return sanitizedMultiError{message: message, causes: safeCauses}
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		safeCause := Error(cause)
+		if message == err.Error() && sameError(safeCause, cause) {
+			return err
+		}
+		return sanitizedError{message: message, cause: safeCause}
+	}
 	if message == err.Error() {
 		return err
 	}
-	return sanitizedError{message: message, cause: err}
+	return sanitizedError{message: message}
+}
+
+func sameError(left, right error) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftValue := reflect.ValueOf(left)
+	rightValue := reflect.ValueOf(right)
+	return leftValue.Type() == rightValue.Type() && leftValue.Comparable() && leftValue.Equal(rightValue)
 }
 
 func sanitizeURLError(err *url.Error) *url.Error {
@@ -242,16 +275,17 @@ func redactValue(value any, extra []string) any {
 func redactText(input string, extra []string) string {
 	redacted := replaceSensitiveJSONFields(input, extra)
 	redacted = urlPattern.ReplaceAllStringFunc(redacted, URL)
+	redacted = schemeRelativeURLPattern.ReplaceAllStringFunc(redacted, URL)
 	redacted = replaceAuthorizationValues(redacted)
-	redacted = replaceSensitivePairs(redacted, assignmentPattern, extra)
-	return replaceSensitivePairs(redacted, headerPattern, extra)
+	redacted = replaceSensitivePairs(redacted, assignmentPrefixPattern, extra)
+	return replaceSensitivePairs(redacted, headerPrefixPattern, extra)
 }
 
 func redactTextWithoutURLs(input string, extra []string) string {
 	redacted := replaceSensitiveJSONFields(input, extra)
 	redacted = replaceAuthorizationValues(redacted)
-	redacted = replaceSensitivePairs(redacted, assignmentPattern, extra)
-	return replaceSensitivePairs(redacted, headerPattern, extra)
+	redacted = replaceSensitivePairs(redacted, assignmentPrefixPattern, extra)
+	return replaceSensitivePairs(redacted, headerPrefixPattern, extra)
 }
 
 func replaceAuthorizationValues(input string) string {
@@ -278,7 +312,7 @@ func replaceAuthorizationAssignments(input string) string {
 		if input[valueStart] == '"' || input[valueStart] == '\'' {
 			redacted.WriteString(input[cursor:valueStart])
 			redacted.WriteString(replacement)
-			cursor = authorizationQuotedValueEnd(input, valueStart)
+			cursor = quotedValueEnd(input, valueStart)
 			continue
 		}
 		firstEnd := authorizationTokenEnd(input, valueStart)
@@ -301,7 +335,7 @@ func replaceAuthorizationAssignments(input string) string {
 	return redacted.String()
 }
 
-func authorizationQuotedValueEnd(input string, start int) int {
+func quotedValueEnd(input string, start int) int {
 	quote := input[start]
 	escaped := false
 	for offset := start + 1; offset < len(input); offset++ {
@@ -521,11 +555,59 @@ func jsonValueEnd(input string, start int) int {
 }
 
 func replaceSensitivePairs(input string, pattern *regexp.Regexp, extra []string) string {
-	return pattern.ReplaceAllStringFunc(input, func(pair string) string {
-		parts := pattern.FindStringSubmatchIndex(pair)
-		if len(parts) < 8 || !SensitiveKey(pair[parts[2]:parts[3]], extra) {
-			return pair
+	matches := pattern.FindAllStringSubmatchIndex(input, -1)
+	if len(matches) == 0 {
+		return input
+	}
+	var redacted strings.Builder
+	redacted.Grow(len(input))
+	cursor := 0
+	for _, match := range matches {
+		if len(match) < 6 || match[0] < cursor || !SensitiveKey(input[match[2]:match[3]], extra) {
+			continue
 		}
-		return pair[:parts[6]] + replacement
-	})
+		valueStart := match[1]
+		if valueStart >= len(input) {
+			continue
+		}
+		valueEnd := sensitivePairValueEnd(input, valueStart)
+		if valueEnd == valueStart {
+			continue
+		}
+		redacted.WriteString(input[cursor:valueStart])
+		redacted.WriteString(replacement)
+		cursor = valueEnd
+	}
+	if cursor == 0 {
+		return input
+	}
+	redacted.WriteString(input[cursor:])
+	return redacted.String()
+}
+
+func sensitivePairValueEnd(input string, start int) int {
+	if input[start] == '"' || input[start] == '\'' {
+		return quotedValueEnd(input, start)
+	}
+	for offset := start; offset < len(input); {
+		if strings.ContainsRune("&\r\n", rune(input[offset])) {
+			return offset
+		}
+		if input[offset] != ' ' && input[offset] != '\t' && input[offset] != ',' && input[offset] != ';' {
+			offset++
+			continue
+		}
+		separator := offset
+		hasWhitespace := false
+		for offset < len(input) && (input[offset] == ' ' || input[offset] == '\t' || input[offset] == ',' || input[offset] == ';') {
+			hasWhitespace = hasWhitespace || input[offset] == ' ' || input[offset] == '\t'
+			offset++
+		}
+		candidateEnd := authorizationTokenEnd(input, offset)
+		if candidateEnd > offset && looksLikeDiagnosticAssignment(input[offset:candidateEnd]) && (hasWhitespace || isCommonDiagnosticAssignment(input[offset:candidateEnd])) {
+			return separator
+		}
+		offset = candidateEnd
+	}
+	return len(input)
 }

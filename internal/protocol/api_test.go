@@ -264,6 +264,23 @@ func TestAPIErrorEnvelopeMessageIsBoundedUTF8(t *testing.T) {
 	}
 }
 
+func TestAPIErrorEnvelopeRedactsDelimitedCredentialsAndRelativeURLs(t *testing.T) {
+	apiErr := newAPIError("/ilink/bot/sendmessage", http.StatusBadGateway, nil, apiEnvelope{
+		Ret:    -2,
+		ErrMsg: `password="correct horse battery staple" proxy=//user:pass@proxy.example/%zz?signature=signed-secret status=502`,
+	})
+	for _, secret := range []string{"correct horse", "//user", ":pass@", "signed-secret"} {
+		if strings.Contains(apiErr.Message, secret) || strings.Contains(apiErr.Error(), secret) {
+			t.Fatalf("API error contains %q: %v", secret, apiErr)
+		}
+	}
+	for _, diagnostic := range []string{"proxy.example/%zz", "status=502", "http=502", "ret=-2"} {
+		if !strings.Contains(apiErr.Error(), diagnostic) {
+			t.Fatalf("API error lost %q: %v", diagnostic, apiErr)
+		}
+	}
+}
+
 func TestGetQRCodeRequestErrorRedactsURL(t *testing.T) {
 	_, err := NewClient().GetQRCode(context.Background(), "https://api.example/\n?bot_token=token-secret", nil)
 	if err == nil {
@@ -333,6 +350,34 @@ func TestUploadToCDNRedactsNetworkAndResponseErrors(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "client error 403") || !strings.Contains(err.Error(), "upload denied") || !strings.Contains(err.Error(), "status=failed") {
 			t.Fatalf("CDN response error lost diagnostics: %v", err)
+		}
+	})
+
+	t.Run("delimited response header", func(t *testing.T) {
+		client := NewClient()
+		client.HTTP = &http.Client{Transport: protocolRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header: http.Header{
+					"X-Error-Message": []string{`upload denied password=abc,def proxy=//user:pass@proxy.example/%zz?signature=signed-secret status=failed`},
+				},
+				Body: http.NoBody,
+			}, nil
+		})}
+
+		_, err := client.UploadToCDN(context.Background(), "https://cdn.example/upload", []byte("encrypted"))
+		if err == nil {
+			t.Fatal("expected CDN response error")
+		}
+		for _, secret := range []string{"abc,def", "//user", ":pass@", "signed-secret"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("CDN response error contains %q: %v", secret, err)
+			}
+		}
+		for _, diagnostic := range []string{"proxy.example/%zz", "status=failed"} {
+			if !strings.Contains(err.Error(), diagnostic) {
+				t.Fatalf("CDN response error lost %q: %v", diagnostic, err)
+			}
 		}
 	})
 }
