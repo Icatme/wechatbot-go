@@ -45,3 +45,5 @@
 - Normalized unsafe bare `<` characters independently in every outbound wire message and referenced text after hooks on a request-owned copy, so caller templates remain unchanged and concurrency-safe; an explicit small HTML-tag set and line-aware fenced code remain preserved, with Markdown stripping and chunking before the final wire-boundary guard.
 
 - Adapted upstream sensitive-data hardening to the Go SDK: centralized recursive and malformed-input redaction (including quoted/delimited credentials and authority-form URLs), capped upstream API error messages at 4 KiB of valid UTF-8, rebuilt unsafe error wrappers while preserving safe causes, and added API/CDN/QR/remote-media/log leakage regressions.
+
+- Bumped the SDK fallback protocol version to `0.4.1` and prepared the source-only patch release covering sensitive-error redaction, safe outbound bare-`<` normalization, concurrency-safe request copies, and the same-package root implementation split.

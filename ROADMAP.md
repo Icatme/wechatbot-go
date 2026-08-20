@@ -4,13 +4,14 @@
 
 ---
 
-## 当前状态（v0.4.0）
+## 当前状态（v0.4.1）
 
 以下详细条目保留迁移背景；当前实现状态以本节为准。
 
 - 已完成：Phase 1.1-1.4、Phase 2.1-2.5、Phase 3.1、Phase 3.3-3.5、Phase 4.1-4.4、Phase 5.1-5.4。
 - v0.3.0 额外修复：未登录/会话暂停发送返回明确错误，文本按 UTF-8 字符安全分片，QR/API 坏响应返回 decode/HTTP 错误，CDN/远程下载复用 SDK HTTP client，多账号 context/cursor 状态在登录后绑定真实账号。
 - v0.4.0 增加可靠投递、显式 Ack/Retry/Drop、按会话并发调度、Agent 工具调用消息、稳定出站身份、结构化 API 错误以及跨重启 fail-closed 的显式重认证。
+- v0.4.1 增加敏感错误与签名 URL 的统一脱敏、API 错误消息上限，以及出站裸 `<` 的 wire-boundary 安全归一化；同时将根包职责拆分到同包文件，不改变公共 API。
 - 未完成：Phase 3.2 语音 SILK → WAV 转码。
 
 ---
