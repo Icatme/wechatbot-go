@@ -15,11 +15,15 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/Icatme/wechatbot-go/internal/redact"
 )
 
 const (
-	DefaultBaseURL = "https://ilinkai.weixin.qq.com"
-	ChannelVersion = "0.4.0"
+	DefaultBaseURL          = "https://ilinkai.weixin.qq.com"
+	ChannelVersion          = "0.4.0"
+	maxAPIErrorMessageBytes = 4 * 1024
 	// iLink-App-Id header value.
 	iLinkAppID = "bot"
 )
@@ -38,7 +42,7 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string {
-	return fmt.Sprintf("ilink api %s: %s (http=%d, ret=%d, errcode=%d)", e.Endpoint, e.Message, e.HTTPStatus, e.RetCode, e.ErrCode)
+	return fmt.Sprintf("ilink api %s: %s (http=%d, ret=%d, errcode=%d)", redact.String(e.Endpoint, nil), redact.String(e.Message, nil), e.HTTPStatus, e.RetCode, e.ErrCode)
 }
 
 // Code returns errcode when present, otherwise ret.
@@ -159,7 +163,7 @@ func (c *Client) GetQRCode(ctx context.Context, baseURL string, localTokenList [
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("get_bot_qrcode request: %w", err)
+		return nil, fmt.Errorf("get_bot_qrcode request: %w", redact.Error(err))
 	}
 	for k, v := range c.CommonHeaders() {
 		req.Header[k] = v
@@ -169,7 +173,7 @@ func (c *Client) GetQRCode(ctx context.Context, baseURL string, localTokenList [
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("get_bot_qrcode: %w", err)
+		return nil, fmt.Errorf("get_bot_qrcode: %w", redact.Error(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
@@ -192,14 +196,14 @@ func (c *Client) PollQRStatus(ctx context.Context, baseURL, qrcode, verifyCode s
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 	if err != nil {
-		return nil, fmt.Errorf("get_qrcode_status request: %w", err)
+		return nil, fmt.Errorf("get_qrcode_status request: %w", redact.Error(err))
 	}
 	for k, v := range c.CommonHeaders() {
 		req.Header[k] = v
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get_qrcode_status: %w", redact.Error(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
@@ -225,7 +229,7 @@ func (c *Client) apiPost(ctx context.Context, baseURL, endpoint, token string, b
 
 	req, err := http.NewRequestWithContext(httpCtx, "POST", u, bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("%s request: %w", endpoint, err)
+		return nil, fmt.Errorf("%s request: %w", endpoint, redact.Error(err))
 	}
 	for k, v := range c.AuthHeaders(token) {
 		req.Header[k] = v
@@ -233,7 +237,7 @@ func (c *Client) apiPost(ctx context.Context, baseURL, endpoint, token string, b
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", endpoint, err)
+		return nil, fmt.Errorf("%s: %w", endpoint, redact.Error(err))
 	}
 	defer resp.Body.Close()
 
@@ -273,11 +277,12 @@ func responseAPIError(endpoint string, status int, raw []byte) *APIError {
 func newAPIError(endpoint string, status int, raw []byte, envelope apiEnvelope) *APIError {
 	message := envelope.ErrMsg
 	if message == "" {
-		message = strings.TrimSpace(string(raw))
+		message = strings.TrimSpace(strings.ToValidUTF8(string(raw), "\uFFFD"))
 	}
 	if message == "" {
 		message = http.StatusText(status)
 	}
+	message = sanitizeAPIErrorMessage(message)
 	return &APIError{
 		Endpoint:   endpoint,
 		Message:    message,
@@ -285,6 +290,23 @@ func newAPIError(endpoint string, status int, raw []byte, envelope apiEnvelope) 
 		RetCode:    envelope.Ret,
 		ErrCode:    envelope.ErrCode,
 	}
+}
+
+func sanitizeAPIErrorMessage(message string) string {
+	message = strings.ToValidUTF8(message, "\uFFFD")
+	return truncateAPIErrorMessage(redact.String(message, nil))
+}
+
+func truncateAPIErrorMessage(message string) string {
+	if len(message) <= maxAPIErrorMessageBytes {
+		return message
+	}
+	const marker = "…(truncated)"
+	end := maxAPIErrorMessageBytes - len(marker)
+	for end > 0 && !utf8.ValidString(message[:end]) {
+		end--
+	}
+	return message[:end] + marker
 }
 
 // GetUpdates performs a long-poll for new messages.
@@ -423,13 +445,13 @@ func (c *Client) UploadToCDN(ctx context.Context, cdnURL string, ciphertext []by
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, "POST", cdnURL, bytes.NewReader(ciphertext))
 		if err != nil {
-			return "", fmt.Errorf("CDN upload request: %w", err)
+			return "", fmt.Errorf("CDN upload request: %w", redact.Error(err))
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
-			lastErr = fmt.Errorf("CDN upload attempt %d: %w", attempt, err)
+			lastErr = fmt.Errorf("CDN upload attempt %d: %w", attempt, redact.Error(err))
 			continue
 		}
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
@@ -438,12 +460,12 @@ func (c *Client) UploadToCDN(ctx context.Context, cdnURL string, ciphertext []by
 			if errMsg == "" {
 				errMsg = fmt.Sprintf("HTTP %d", resp.StatusCode)
 			}
-			return "", fmt.Errorf("CDN upload client error %d: %s", resp.StatusCode, errMsg)
+			return "", fmt.Errorf("CDN upload client error %d: %s", resp.StatusCode, redact.String(errMsg, nil))
 		}
 		if resp.StatusCode != 200 {
 			errMsg := resp.Header.Get("x-error-message")
 			resp.Body.Close()
-			lastErr = fmt.Errorf("CDN upload server error %d: %s", resp.StatusCode, errMsg)
+			lastErr = fmt.Errorf("CDN upload server error %d: %s", resp.StatusCode, redact.String(errMsg, nil))
 			continue
 		}
 

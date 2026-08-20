@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestChannelVersionBumped(t *testing.T) {
@@ -166,4 +168,177 @@ func TestAPIErrorPreservesResponseDimensions(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAPIErrorRedactsSensitiveResponseBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"ret":-2,"errcode":401,"status":"failed","details":{"bot_token":"token-secret","local_token_list":["old-a","old-b"],"upload_full_url":"https://cdn.example/upload?signature=url-secret"}}`))
+	}))
+	defer server.Close()
+
+	err := NewClient().SendMessage(context.Background(), server.URL, "request-token", map[string]interface{}{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	for _, secret := range []string{"token-secret", "old-a", "old-b", "url-secret"} {
+		if strings.Contains(err.Error(), secret) || strings.Contains(apiErr.Message, secret) {
+			t.Errorf("API error contains %q: %v", secret, err)
+		}
+	}
+	if apiErr.HTTPStatus != http.StatusBadGateway || apiErr.RetCode != -2 || apiErr.ErrCode != 401 {
+		t.Fatalf("API error lost response dimensions: %+v", apiErr)
+	}
+	if !strings.Contains(apiErr.Message, `"status":"failed"`) {
+		t.Fatalf("API error lost non-sensitive body diagnostics: %s", apiErr.Message)
+	}
+}
+
+func TestAPIErrorRedactsMalformedResponseBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`partial={"verify_code":"code-secret","aes_key":"aes-secret"`))
+	}))
+	defer server.Close()
+
+	_, err := NewClient().GetQRCode(context.Background(), server.URL, nil)
+	if err == nil {
+		t.Fatal("expected API error")
+	}
+	if strings.Contains(err.Error(), "code-secret") || strings.Contains(err.Error(), "aes-secret") {
+		t.Fatalf("API error leaked malformed response body: %v", err)
+	}
+	if !strings.Contains(err.Error(), "partial=") || !strings.Contains(err.Error(), "http=500") {
+		t.Fatalf("API error lost diagnostics: %v", err)
+	}
+}
+
+func TestAPIErrorRawFallbackIsBoundedUTF8(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"ret":-2,"errcode":401,"bot_token":"token-secret","padding":"` + strings.Repeat("界", maxAPIErrorMessageBytes) + `"}`))
+	}))
+	defer server.Close()
+
+	err := NewClient().SendMessage(context.Background(), server.URL, "request-token", map[string]interface{}{})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected APIError, got %T: %v", err, err)
+	}
+	if len(apiErr.Message) > maxAPIErrorMessageBytes || !utf8.ValidString(apiErr.Message) {
+		t.Fatalf("raw fallback is not bounded valid UTF-8: bytes=%d valid=%v", len(apiErr.Message), utf8.ValidString(apiErr.Message))
+	}
+	if strings.Contains(apiErr.Message, "token-secret") || !strings.HasSuffix(apiErr.Message, "…(truncated)") {
+		t.Fatalf("raw fallback was unsafe or not marked as truncated: %s", apiErr.Message)
+	}
+	if apiErr.HTTPStatus != http.StatusBadGateway || apiErr.RetCode != -2 || apiErr.ErrCode != 401 {
+		t.Fatalf("API error lost response dimensions: %+v", apiErr)
+	}
+	for _, diagnostic := range []string{"http=502", "ret=-2", "errcode=401"} {
+		if !strings.Contains(err.Error(), diagnostic) {
+			t.Fatalf("API error lost %q: %v", diagnostic, err)
+		}
+	}
+}
+
+func TestAPIErrorEnvelopeMessageIsBoundedUTF8(t *testing.T) {
+	apiErr := newAPIError("/ilink/bot/sendmessage", http.StatusBadRequest, nil, apiEnvelope{
+		Ret:     -2,
+		ErrCode: 422,
+		ErrMsg:  "authorization=Bearer token-secret status=401 " + string([]byte{0xff}) + strings.Repeat("界", maxAPIErrorMessageBytes),
+	})
+	if len(apiErr.Message) > maxAPIErrorMessageBytes || !utf8.ValidString(apiErr.Message) {
+		t.Fatalf("envelope errmsg is not bounded valid UTF-8: bytes=%d valid=%v", len(apiErr.Message), utf8.ValidString(apiErr.Message))
+	}
+	if strings.Contains(apiErr.Message, "token-secret") || !strings.HasSuffix(apiErr.Message, "…(truncated)") {
+		t.Fatalf("envelope errmsg was unsafe or not marked as truncated: %s", apiErr.Message)
+	}
+	if apiErr.HTTPStatus != http.StatusBadRequest || apiErr.RetCode != -2 || apiErr.ErrCode != 422 {
+		t.Fatalf("API error lost response dimensions: %+v", apiErr)
+	}
+	for _, diagnostic := range []string{"http=400", "ret=-2", "errcode=422"} {
+		if !strings.Contains(apiErr.Error(), diagnostic) {
+			t.Fatalf("API error lost %q: %v", diagnostic, apiErr)
+		}
+	}
+}
+
+func TestGetQRCodeRequestErrorRedactsURL(t *testing.T) {
+	_, err := NewClient().GetQRCode(context.Background(), "https://api.example/\n?bot_token=token-secret", nil)
+	if err == nil {
+		t.Fatal("expected request construction error")
+	}
+	if strings.Contains(err.Error(), "token-secret") || !strings.Contains(err.Error(), "api.example") {
+		t.Fatalf("request construction error was unsafe or incomplete: %v", err)
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || strings.Contains(urlErr.URL, "token-secret") {
+		t.Fatalf("errors.As returned unsafe URL error: %+v", urlErr)
+	}
+}
+
+func TestPollQRStatusNetworkErrorRedactsCredentials(t *testing.T) {
+	cause := errors.New("network unavailable")
+	client := NewClient()
+	client.HTTP = &http.Client{Transport: protocolRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, cause
+	})}
+
+	_, err := client.PollQRStatus(context.Background(), "https://api.example", "qr-secret", "code-secret")
+	if err == nil {
+		t.Fatal("expected polling error")
+	}
+	if strings.Contains(err.Error(), "qr-secret") || strings.Contains(err.Error(), "code-secret") {
+		t.Fatalf("QR polling error leaked credentials: %v", err)
+	}
+	if !strings.Contains(err.Error(), "api.example/ilink/bot/get_qrcode_status") || !errors.Is(err, cause) {
+		t.Fatalf("QR polling error lost diagnostics or cause: %v", err)
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || strings.Contains(urlErr.URL, "qr-secret") {
+		t.Fatalf("errors.As returned unsafe URL error: %+v", urlErr)
+	}
+}
+
+func TestUploadToCDNRedactsNetworkAndResponseErrors(t *testing.T) {
+	t.Run("network URL", func(t *testing.T) {
+		cause := errors.New("network unavailable")
+		client := NewClient()
+		client.HTTP = &http.Client{Transport: protocolRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, cause
+		})}
+
+		_, err := client.UploadToCDN(context.Background(), "https://cdn.example/upload?signature=signed-secret", []byte("encrypted"))
+		if err == nil || strings.Contains(err.Error(), "signed-secret") || !errors.Is(err, cause) {
+			t.Fatalf("unsafe or incomplete CDN network error: %v", err)
+		}
+	})
+
+	t.Run("response header", func(t *testing.T) {
+		client := NewClient()
+		client.HTTP = &http.Client{Transport: protocolRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header: http.Header{
+					"X-Error-Message": []string{`upload denied x-encrypted-param=download-secret x_encrypted_param=alternate-secret status=failed`},
+				},
+				Body: http.NoBody,
+			}, nil
+		})}
+
+		_, err := client.UploadToCDN(context.Background(), "https://cdn.example/upload", []byte("encrypted"))
+		if err == nil || strings.Contains(err.Error(), "download-secret") || strings.Contains(err.Error(), "alternate-secret") {
+			t.Fatalf("CDN response error leaked credentials: %v", err)
+		}
+		if !strings.Contains(err.Error(), "client error 403") || !strings.Contains(err.Error(), "upload denied") || !strings.Contains(err.Error(), "status=failed") {
+			t.Fatalf("CDN response error lost diagnostics: %v", err)
+		}
+	})
+}
+
+type protocolRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f protocolRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

@@ -39,3 +39,7 @@
 ## 2026-08-12
 
 - Split the 1,804-line root `bot.go` into same-package responsibility files for login, session gating, polling, content, media, message parsing, handlers, and logging; preserved declarations, public API, control flow, and lock ordering, and refreshed the documented Go file structure.
+
+## 2026-08-20
+
+- Adapted upstream sensitive-data hardening to the Go SDK: centralized recursive and malformed-input redaction, capped upstream API error messages at 4 KiB of valid UTF-8, sanitized API/CDN/QR/remote-media network errors without losing safe typed traversal, and added focused leakage regressions.
