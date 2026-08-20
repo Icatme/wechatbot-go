@@ -2,9 +2,11 @@ package remote
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -46,9 +48,44 @@ func TestDownloadFromURLPath(t *testing.T) {
 }
 
 func TestDownloadInvalidURL(t *testing.T) {
-	_, _, err := Download(context.Background(), "ftp://example.com/a.png")
+	_, _, err := Download(context.Background(), "ftp://example.com/a.png?signature=signed-secret")
 	if err == nil {
 		t.Fatal("expected error for invalid scheme")
+	}
+	if strings.Contains(err.Error(), "signed-secret") || !strings.Contains(err.Error(), "example.com/a.png") {
+		t.Fatalf("invalid URL error was unsafe or incomplete: %v", err)
+	}
+}
+
+func TestDownloadInvalidAuthorityURLRedactsUserinfo(t *testing.T) {
+	_, _, err := Download(context.Background(), "//user:pass@host.example/%zz")
+	if err == nil {
+		t.Fatal("expected error for malformed authority URL")
+	}
+	if strings.Contains(err.Error(), "user") || strings.Contains(err.Error(), "pass") {
+		t.Fatalf("invalid authority URL error leaked userinfo: %v", err)
+	}
+	if !strings.Contains(err.Error(), "host.example/%zz") {
+		t.Fatalf("invalid authority URL error lost diagnostics: %v", err)
+	}
+}
+
+func TestDownloadNetworkErrorRedactsSignedURL(t *testing.T) {
+	cause := errors.New("network unavailable")
+	client := &http.Client{Transport: remoteRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, cause
+	})}
+
+	_, _, err := DownloadWithClient(context.Background(), client, "https://media.example/file?signature=signed-secret")
+	if err == nil || strings.Contains(err.Error(), "signed-secret") {
+		t.Fatalf("remote download leaked signed URL: %v", err)
+	}
+	if !strings.Contains(err.Error(), "media.example/file") || !errors.Is(err, cause) {
+		t.Fatalf("remote download lost diagnostics or cause: %v", err)
+	}
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || strings.Contains(urlErr.URL, "signed-secret") {
+		t.Fatalf("errors.As returned unsafe URL error: %+v", urlErr)
 	}
 }
 
@@ -78,4 +115,10 @@ func TestDownloadMaxSize(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected max size error")
 	}
+}
+
+type remoteRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f remoteRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
 }

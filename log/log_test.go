@@ -36,13 +36,59 @@ func TestSensitiveFieldRedaction(t *testing.T) {
 }
 
 func TestRedactString(t *testing.T) {
-	s := "url?bot_token=abc123&context_token=xyz&user_id=1"
+	s := "url?bot_token=abc123&context_token=xyz&user_id=1 cdn=https://cdn.example/download?signature=signed"
 	got := RedactString(s)
-	if strings.Contains(got, "abc123") || strings.Contains(got, "xyz") {
+	if strings.Contains(got, "abc123") || strings.Contains(got, "xyz") || strings.Contains(got, "signed") {
 		t.Fatalf("tokens should be redacted: %s", got)
 	}
 	if !strings.Contains(got, "user_id=1") {
 		t.Fatalf("non-sensitive param should remain: %s", got)
+	}
+}
+
+func TestLoggerRedactsNestedAndMalformedValues(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New(Options{Level: InfoLevel, Output: &buf, ExtraSensitiveKeys: []string{"session_cookie"}})
+	logger.Info(
+		`failed: {"qrcode":"qr-secret","local_token_list":["old-a","old-b"]`,
+		F("response", map[string]interface{}{
+			"status": "failed",
+			"nested": []interface{}{map[string]string{
+				"aes_key":         "aes-secret",
+				"upload_full_url": "https://cdn.example/upload?signature=url-secret",
+			}},
+		}),
+		F("session_cookie", "cookie-secret"),
+	)
+	out := buf.String()
+	for _, secret := range []string{"qr-secret", "old-a", "old-b", "aes-secret", "url-secret", "cookie-secret"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("log contains %q: %s", secret, out)
+		}
+	}
+	if !strings.Contains(out, "failed") || !strings.Contains(out, "status") {
+		t.Fatalf("non-sensitive diagnostics were lost: %s", out)
+	}
+}
+
+func TestLoggerRedactsDelimitedCredentialsAndSchemeRelativeURLs(t *testing.T) {
+	var buf bytes.Buffer
+	logger := New(Options{Level: InfoLevel, Output: &buf})
+	logger.Info(
+		`request password="correct horse battery staple" status=401`,
+		F("detail", "password=abc,def status=401"),
+		F("proxy", "fetch //user:pass@proxy.example/%zz?signature=signed-secret status=502"),
+	)
+	out := buf.String()
+	for _, secret := range []string{"correct horse", "abc,def", "//user", ":pass@", "signed-secret"} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("log contains %q: %s", secret, out)
+		}
+	}
+	for _, diagnostic := range []string{"status=401", "status=502", "proxy.example/%zz"} {
+		if !strings.Contains(out, diagnostic) {
+			t.Fatalf("log lost %q: %s", diagnostic, out)
+		}
 	}
 }
 

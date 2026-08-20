@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+
+	"github.com/Icatme/wechatbot-go/internal/redact"
 )
 
 const maxDownloadBytes = 100 * 1024 * 1024
@@ -24,7 +26,7 @@ func Download(ctx context.Context, rawURL string) (data []byte, fileName string,
 func DownloadWithClient(ctx context.Context, client *http.Client, rawURL string) (data []byte, fileName string, err error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return nil, "", fmt.Errorf("invalid remote URL %q", rawURL)
+		return nil, "", fmt.Errorf("invalid remote URL %q", redact.URL(rawURL))
 	}
 	if client == nil {
 		client = http.DefaultClient
@@ -32,12 +34,12 @@ func DownloadWithClient(ctx context.Context, client *http.Client, rawURL string)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, "", fmt.Errorf("create request: %w", err)
+		return nil, "", fmt.Errorf("create request: %w", redact.Error(err))
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("fetch remote media: %w", err)
+		return nil, "", fmt.Errorf("fetch remote media: %w", redact.Error(err))
 	}
 	defer resp.Body.Close()
 
