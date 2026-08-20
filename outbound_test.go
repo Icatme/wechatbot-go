@@ -276,6 +276,208 @@ func TestAfterSendObservesFailureAndCannotOverrideSuccess(t *testing.T) {
 	})
 }
 
+func TestOutboundTextNormalizationOnWire(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         string
+		want          string
+		stripMarkdown bool
+		direct        bool
+		hookText      string
+	}{
+		{
+			name:  "send preserves tags and fenced code",
+			input: "rate<80%\n```\nx < 80\n```\n<div>ok</div>",
+			want:  "rate＜80%\n```\nx < 80\n```\n<div>ok</div>",
+		},
+		{
+			name:          "markdown stripping exposes fenced comparison",
+			input:         "```go\nif (x < 80) {}\n```",
+			want:          "if (x ＜ 80) {}",
+			stripMarkdown: true,
+		},
+		{
+			name:   "exact item send",
+			input:  "value<50mg",
+			want:   "value＜50mg",
+			direct: true,
+		},
+		{
+			name:     "hook mutation",
+			input:    "original",
+			want:     "hooked＜20",
+			direct:   true,
+			hookText: "hooked<20",
+		},
+		{
+			name:     "send hook mutation",
+			input:    "original",
+			want:     "hooked＜10",
+			hookText: "hooked<10",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan WireMessage, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Message WireMessage `json:"msg"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				received <- body.Message
+				_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+			}))
+			defer server.Close()
+
+			bot := newOutboundTestBot(t, server)
+			bot.opts.StripMarkdown = tc.stripMarkdown
+			if tc.hookText != "" {
+				bot.Hooks().BeforeSend.Register(func(request *SendRequest) error {
+					request.Message.Item.TextItem.Text = tc.hookText
+					return nil
+				})
+			}
+			if tc.direct {
+				_, err := bot.SendMessage(context.Background(), "user-1", OutboundMessage{
+					Item: MessageItem{Type: ItemText, TextItem: &TextItem{Text: tc.input}},
+				})
+				if err != nil {
+					t.Fatalf("SendMessage: %v", err)
+				}
+			} else if err := bot.Send(context.Background(), "user-1", tc.input); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+
+			wire := <-received
+			if len(wire.ItemList) != 1 || wire.ItemList[0].TextItem == nil {
+				t.Fatalf("wire item = %+v", wire.ItemList)
+			}
+			if got := wire.ItemList[0].TextItem.Text; got != tc.want {
+				t.Fatalf("wire text = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTextChunksNormalizeEachWirePayload(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantChunks []string
+	}{
+		{
+			name:  "allowed tag",
+			input: strings.Repeat("x", maxTextChars-1) + "<div>ok</div>",
+			wantChunks: []string{
+				strings.Repeat("x", maxTextChars-1) + "＜",
+				"div>ok</div>",
+			},
+		},
+		{
+			name:  "fenced code",
+			input: "```\n" + strings.Repeat("x", maxTextChars-4) + "value < 80\n```\n",
+			wantChunks: []string{
+				"```\n" + strings.Repeat("x", maxTextChars-4),
+				"value ＜ 80\n```\n",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			received := make(chan string, len(tc.wantChunks))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Message WireMessage `json:"msg"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				received <- body.Message.ItemList[0].TextItem.Text
+				_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+			}))
+			defer server.Close()
+
+			bot := newOutboundTestBot(t, server)
+			if err := bot.Send(context.Background(), "user-1", tc.input); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			for index, want := range tc.wantChunks {
+				chunk := <-received
+				if chunk != want {
+					t.Fatalf("chunk %d = %q, want %q", index, chunk, want)
+				}
+			}
+		})
+	}
+}
+
+func TestOutboundReferenceTextNormalizationOnWire(t *testing.T) {
+	received := make(chan WireMessage, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Message WireMessage `json:"msg"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		received <- body.Message
+		_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+	}))
+	defer server.Close()
+
+	bot := newOutboundTestBot(t, server)
+	bot.Hooks().BeforeSend.Register(func(request *SendRequest) error {
+		request.Message.Item.RefMsg.Title = "hook title<50"
+		request.Message.Item.RefMsg.MessageItem.TextItem.Text = "hook nested<40"
+		request.Message.Item.RefMsg.MessageItem.RefMsg = &RefMessage{
+			Title: "deep title<30",
+			MessageItem: &MessageItem{
+				Type:     ItemText,
+				TextItem: &TextItem{Text: "deep text<20"},
+			},
+		}
+		return nil
+	})
+	_, err := bot.SendMessage(context.Background(), "user-1", OutboundMessage{Item: MessageItem{
+		Type:     ItemText,
+		TextItem: &TextItem{Text: "body<80"},
+		RefMsg: &RefMessage{
+			Title: "original title<70",
+			MessageItem: &MessageItem{
+				Type:     ItemText,
+				TextItem: &TextItem{Text: "original nested<60"},
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+
+	item := receivedItem(t, <-received)
+	if item.TextItem.Text != "body＜80" || item.RefMsg.Title != "hook title＜50" {
+		t.Fatalf("root/reference text = %+v", item)
+	}
+	nested := item.RefMsg.MessageItem
+	if nested == nil || nested.TextItem == nil || nested.TextItem.Text != "hook nested＜40" {
+		t.Fatalf("nested item = %+v", nested)
+	}
+	if nested.RefMsg == nil || nested.RefMsg.Title != "deep title＜30" || nested.RefMsg.MessageItem == nil || nested.RefMsg.MessageItem.TextItem == nil || nested.RefMsg.MessageItem.TextItem.Text != "deep text＜20" {
+		t.Fatalf("deep reference = %+v", nested.RefMsg)
+	}
+}
+
+func receivedItem(t *testing.T, wire WireMessage) MessageItem {
+	t.Helper()
+	if len(wire.ItemList) != 1 {
+		t.Fatalf("wire items = %+v", wire.ItemList)
+	}
+	return wire.ItemList[0]
+}
+
 func TestSendTextChunksUseDistinctClientIDs(t *testing.T) {
 	clientIDs := make(chan string, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

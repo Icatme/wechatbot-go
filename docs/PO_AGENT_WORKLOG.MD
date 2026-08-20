@@ -39,3 +39,7 @@
 ## 2026-08-12
 
 - Split the 1,804-line root `bot.go` into same-package responsibility files for login, session gating, polling, content, media, message parsing, handlers, and logging; preserved declarations, public API, control flow, and lock ordering, and refreshed the documented Go file structure.
+
+## 2026-08-20
+
+- Normalized unsafe bare `<` characters independently in every outbound wire message and referenced text after hooks, while preserving an explicit small HTML-tag set and line-aware fenced code contained within that message; Markdown stripping and chunking run before this final wire-boundary guard.

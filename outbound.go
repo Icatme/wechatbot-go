@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Icatme/wechatbot-go/internal/markdown"
 	"github.com/Icatme/wechatbot-go/internal/protocol"
 )
 
@@ -163,6 +164,7 @@ func (b *Bot) sendMessage(ctx context.Context, sessionGeneration uint64, userID,
 	if request.Message.ClientID != validatedClientID {
 		return result, fmt.Errorf("BeforeSend hook cannot change client ID")
 	}
+	normalizeMessageItemText(&request.Message.Item, make(map[*MessageItem]struct{}))
 	if err := validateOutboundMessage(request.Message); err != nil {
 		return result, err
 	}
@@ -186,6 +188,24 @@ func (b *Bot) sendMessage(ctx context.Context, sessionGeneration uint64, userID,
 		b.reportError(fmt.Errorf("AfterSend hook failed: %w", hookErr))
 	}
 	return result, sendErr
+}
+
+func normalizeMessageItemText(item *MessageItem, visited map[*MessageItem]struct{}) {
+	if item == nil {
+		return
+	}
+	if _, ok := visited[item]; ok {
+		return
+	}
+	visited[item] = struct{}{}
+
+	if item.TextItem != nil {
+		item.TextItem.Text = markdown.NormalizeBareLessThan(item.TextItem.Text)
+	}
+	if item.RefMsg != nil {
+		item.RefMsg.Title = markdown.NormalizeBareLessThan(item.RefMsg.Title)
+		normalizeMessageItemText(item.RefMsg.MessageItem, visited)
+	}
 }
 
 func validateOutboundMessage(msg OutboundMessage) error {
