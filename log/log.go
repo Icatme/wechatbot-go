@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Icatme/wechatbot-go/internal/redact"
 )
 
 // Level indicates the severity of a log entry.
@@ -36,10 +37,10 @@ func F(key string, value interface{}) Field {
 
 // Logger writes structured, redacted log entries.
 type Logger struct {
-	level    Level
-	out      io.Writer
-	redactor *strings.Replacer
-	mu       sync.Mutex
+	level              Level
+	out                io.Writer
+	extraSensitiveKeys []string
+	mu                 sync.Mutex
 }
 
 // Options configures a Logger.
@@ -59,9 +60,9 @@ func New(opts Options) *Logger {
 		opts.Output = os.Stderr
 	}
 	return &Logger{
-		level:    opts.Level,
-		out:      opts.Output,
-		redactor: buildRedactor(opts.ExtraSensitiveKeys),
+		level:              opts.Level,
+		out:                opts.Output,
+		extraSensitiveKeys: append([]string(nil), opts.ExtraSensitiveKeys...),
 	}
 }
 
@@ -94,11 +95,11 @@ func (l *Logger) Log(level Level, msg string, fields ...Field) {
 	b.WriteString(",")
 	writeJSONField(&b, "level", string(level), false)
 	b.WriteString(",")
-	writeJSONField(&b, "msg", redactMessage(l.redact(msg)), false)
+	writeJSONField(&b, "msg", l.redact(msg), false)
 	for _, f := range fields {
 		b.WriteString(",")
 		key := sanitizeKey(f.Key)
-		if isSensitiveKey(f.Key) {
+		if redact.SensitiveKey(f.Key, l.extraSensitiveKeys) {
 			writeJSONField(&b, key, "***", false)
 			continue
 		}
@@ -156,7 +157,7 @@ func writeValue(b *strings.Builder, key string, v interface{}, l *Logger) {
 }
 
 func (l *Logger) redact(s string) string {
-	return l.redactor.Replace(s)
+	return redact.String(s, l.extraSensitiveKeys)
 }
 
 func sanitizeKey(key string) string {
@@ -164,47 +165,10 @@ func sanitizeKey(key string) string {
 	return key
 }
 
-var sensitiveKeyPatterns = []string{
-	"_token", "token_", "bot_token", "context_token", "typing_ticket",
-	"auth_", "_auth", "credential", "password", "secret", "api_key", "apikey",
-	"aes_key", "encrypt_query_param", "filekey",
-}
-
-func isSensitiveKey(key string) bool {
-	lower := strings.ToLower(key)
-	for _, p := range sensitiveKeyPatterns {
-		if strings.Contains(lower, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func buildRedactor(extra []string) *strings.Replacer {
-	// Redact common token patterns in free-form strings.
-	replacements := []string{
-		"bot_token=", "bot_token=***",
-		"context_token=", "context_token=***",
-		"typing_ticket=", "typing_ticket=***",
-		"encrypt_query_param=", "encrypt_query_param=***",
-		"filekey=", "filekey=***",
-	}
-	for _, k := range extra {
-		replacements = append(replacements, k+"=", k+"=***")
-	}
-	return strings.NewReplacer(replacements...)
-}
-
-var tokenPattern = regexp.MustCompile(`\b(bot_token|context_token|typing_ticket|encrypt_query_param|filekey)=[^\s&"]+`)
-
-// RedactString returns a copy of s with known token query parameters redacted.
+// RedactString returns a copy of s with known sensitive fields and signed URL
+// parameters redacted.
 func RedactString(s string) string {
-	return tokenPattern.ReplaceAllString(s, "$1=***")
-}
-
-// redactMessage scans a free-form message and redacts embedded token values.
-func redactMessage(s string) string {
-	return tokenPattern.ReplaceAllString(s, "$1=***")
+	return redact.String(s, nil)
 }
 
 func levelPriority(level Level) int {

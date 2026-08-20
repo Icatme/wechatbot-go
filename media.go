@@ -12,6 +12,7 @@ import (
 
 	"github.com/Icatme/wechatbot-go/internal/crypto"
 	"github.com/Icatme/wechatbot-go/internal/protocol"
+	"github.com/Icatme/wechatbot-go/internal/redact"
 )
 
 const maxDownloadBytes = 100 * 1024 * 1024
@@ -87,11 +88,11 @@ func (b *Bot) cdnDownload(ctx context.Context, media *CDNMedia, aeskeyOverride s
 
 	req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("cdn download request: %w", err)
+		return nil, fmt.Errorf("cdn download request: %w", redact.Error(err))
 	}
 	resp, err := b.client.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("cdn download: %w", err)
+		return nil, fmt.Errorf("cdn download: %w", redact.Error(err))
 	}
 	defer resp.Body.Close()
 
