@@ -42,4 +42,4 @@
 
 ## 2026-08-20
 
-- Normalized unsafe bare `<` characters independently in every outbound wire message and referenced text after hooks, while preserving an explicit small HTML-tag set and line-aware fenced code contained within that message; Markdown stripping and chunking run before this final wire-boundary guard.
+- Normalized unsafe bare `<` characters independently in every outbound wire message and referenced text after hooks on a request-owned copy, so caller templates remain unchanged and concurrency-safe; an explicit small HTML-tag set and line-aware fenced code remain preserved, with Markdown stripping and chunking before the final wire-boundary guard.

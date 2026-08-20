@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -467,6 +468,91 @@ func TestOutboundReferenceTextNormalizationOnWire(t *testing.T) {
 	}
 	if nested.RefMsg == nil || nested.RefMsg.Title != "deep title＜30" || nested.RefMsg.MessageItem == nil || nested.RefMsg.MessageItem.TextItem == nil || nested.RefMsg.MessageItem.TextItem.Text != "deep text＜20" {
 		t.Fatalf("deep reference = %+v", nested.RefMsg)
+	}
+}
+
+func TestOutboundTextNormalizationDoesNotMutateCaller(t *testing.T) {
+	received := make(chan WireMessage, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Message WireMessage `json:"msg"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		received <- body.Message
+		_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+	}))
+	defer server.Close()
+
+	rootText := &TextItem{Text: "body<80"}
+	nestedText := &TextItem{Text: "nested<60"}
+	ref := &RefMessage{
+		Title: "title<70",
+		MessageItem: &MessageItem{
+			Type:     ItemText,
+			TextItem: nestedText,
+		},
+	}
+	message := OutboundMessage{Item: MessageItem{
+		Type:     ItemText,
+		TextItem: rootText,
+		RefMsg:   ref,
+	}}
+
+	bot := newOutboundTestBot(t, server)
+	if _, err := bot.SendMessage(context.Background(), "user-1", message); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if rootText.Text != "body<80" || ref.Title != "title<70" || nestedText.Text != "nested<60" {
+		t.Fatalf("caller message was mutated: root=%q title=%q nested=%q", rootText.Text, ref.Title, nestedText.Text)
+	}
+
+	item := receivedItem(t, <-received)
+	if item.TextItem == nil || item.TextItem.Text != "body＜80" || item.RefMsg == nil || item.RefMsg.Title != "title＜70" || item.RefMsg.MessageItem == nil || item.RefMsg.MessageItem.TextItem == nil || item.RefMsg.MessageItem.TextItem.Text != "nested＜60" {
+		t.Fatalf("wire item was not normalized: %+v", item)
+	}
+}
+
+func TestConcurrentSendMessageCanReuseTemplate(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Message WireMessage `json:"msg"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if len(body.Message.ItemList) != 1 || body.Message.ItemList[0].TextItem == nil || body.Message.ItemList[0].TextItem.Text != "shared＜50" {
+			t.Errorf("wire items were not normalized: %+v", body.Message.ItemList)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]int{"ret": 0})
+	}))
+	defer server.Close()
+
+	textItem := &TextItem{Text: "shared<50"}
+	message := OutboundMessage{Item: MessageItem{Type: ItemText, TextItem: textItem}}
+	bot := newOutboundTestBot(t, server)
+
+	const sends = 8
+	var wait sync.WaitGroup
+	errs := make(chan error, sends)
+	for range sends {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			_, err := bot.SendMessage(context.Background(), "user-1", message)
+			errs <- err
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("SendMessage: %v", err)
+		}
+	}
+	if textItem.Text != "shared<50" {
+		t.Fatalf("shared caller template was mutated: %q", textItem.Text)
 	}
 }
 
