@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -380,6 +381,36 @@ func TestUploadToCDNRedactsNetworkAndResponseErrors(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestGetUpdatesLeavesMarginAfterServerLongPoll(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		serverWait   time.Duration
+		wantDeadline time.Duration
+	}{
+		{"server suggests 35 seconds", 35 * time.Second, 65 * time.Second},
+		{"initial 45 second wait", 45 * time.Second, 65 * time.Second},
+		{"longer server wait", 75 * time.Second, 90 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := NewClient()
+			client.HTTP.Transport = protocolRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				deadline, ok := req.Context().Deadline()
+				if !ok {
+					t.Fatal("getUpdates request has no deadline")
+				}
+				remaining := time.Until(deadline)
+				if remaining < tc.wantDeadline-time.Second || remaining > tc.wantDeadline {
+					t.Fatalf("request deadline = %s, want about %s", remaining, tc.wantDeadline)
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"ret":0,"msgs":[],"get_updates_buf":""}`)), Header: make(http.Header), Request: req}, nil
+			})
+			if _, err := client.GetUpdates(context.Background(), "https://ilink.example", "token", "", tc.serverWait); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 type protocolRoundTripFunc func(*http.Request) (*http.Response, error)

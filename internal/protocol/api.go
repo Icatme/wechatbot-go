@@ -97,7 +97,7 @@ type Client struct {
 // NewClient creates a protocol client with sensible defaults.
 func NewClient() *Client {
 	return &Client{
-		HTTP:     &http.Client{Timeout: 45 * time.Second},
+		HTTP:     &http.Client{Timeout: 2 * time.Minute},
 		BotAgent: defaultBotAgent,
 	}
 }
@@ -310,13 +310,15 @@ func truncateAPIErrorMessage(message string) string {
 }
 
 // GetUpdates performs a long-poll for new messages.
-// timeout controls the client-side HTTP timeout for this request.
+// timeout is the server's expected long-poll wait. Leave time for network
+// transit and response decoding before the client deadline.
 func (c *Client) GetUpdates(ctx context.Context, baseURL, token, cursor string, timeout time.Duration) (*GetUpdatesResponse, error) {
 	body := map[string]interface{}{
 		"get_updates_buf": cursor,
 		"base_info":       c.baseInfo(),
 	}
-	raw, err := c.apiPost(ctx, baseURL, "/ilink/bot/getupdates", token, body, timeout)
+	requestTimeout := max(timeout+15*time.Second, 65*time.Second)
+	raw, err := c.apiPost(ctx, baseURL, "/ilink/bot/getupdates", token, body, requestTimeout)
 	if err != nil {
 		return nil, err
 	}
