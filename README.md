@@ -18,7 +18,13 @@ go get github.com/Icatme/wechatbot-go
 
 要求 Go 1.25+，零 CGO 依赖。
 
-## 最近更新（v0.4.1）
+## 最近更新（v0.4.2）
+
+`v0.4.2` 为微信消息长轮询的客户端超时保留网络传输余量：请求至少等待 65 秒，且比服务端建议的轮询时间多 15 秒，避免正常长轮询在边界处误报超时。SDK 的 HTTP 总超时为 2 分钟。
+
+完整说明见 [v0.4.2 Release](https://github.com/Icatme/wechatbot-go/releases/tag/v0.4.2)。
+
+### v0.4.1
 
 `v0.4.1` 是兼容性补丁版本：
 

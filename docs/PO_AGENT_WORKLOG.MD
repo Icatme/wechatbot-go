@@ -47,3 +47,7 @@
 - Adapted upstream sensitive-data hardening to the Go SDK: centralized recursive and malformed-input redaction (including quoted/delimited credentials and authority-form URLs), capped upstream API error messages at 4 KiB of valid UTF-8, rebuilt unsafe error wrappers while preserving safe causes, and added API/CDN/QR/remote-media/log leakage regressions.
 
 - Bumped the SDK fallback protocol version to `0.4.1` and prepared the source-only patch release covering sensitive-error redaction, safe outbound bare-`<` normalization, concurrency-safe request copies, and the same-package root implementation split.
+
+## 2026-09-25
+
+- Prepared v0.4.2 long-poll timeout correction: getUpdates request deadline is at least 65 seconds and at least 15 seconds beyond the server-suggested wait; the HTTP client's overall cap is 2 minutes. Extended the existing protocol test to inspect request deadlines without live network use. Updated channel-version fallback and release documentation. OC AI Go's polling notices and actual-send guidance are tracked in its shared worklog.
